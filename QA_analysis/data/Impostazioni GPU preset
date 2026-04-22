@@ -1,0 +1,250 @@
+## 4 GPU
+env_cfg = {
+        "TRANSFORMERS_NO_TF": "1",
+
+        # --- paths / base config ---
+        "DIME_BG_AUDIO_DIR": "/nas/home/fingenito/HumMusQA/mtg-upf___hum_mus_qa/default/0.0.0/ca7bad071bde0b27e55eca050f2e88b49ae01f56",
+        "TF_CPP_MIN_LOG_LEVEL": "3",
+        "DIME_VALUE_MODE": "logit",
+        "DIME_PROMPTS_FILE": "",
+
+        # ==========================================================
+        # QUALITY / EXPECTATION
+        # ==========================================================
+        "DIME_NUM_EXPECTATION_SAMPLES": "16",
+
+        # ==========================================================
+        # DIME scheduling / batching
+        # ==========================================================
+        "DIME_QUEUE_WINDOW": "128",
+        "DIME_L_BATCH_SIZE": "10",
+        "DIME_LIME_BATCH_SIZE": "14",
+        "DIME_STEP5_AUDIO_PERTURB_BATCH": "64",
+        "DIME_STEP5_TEXT_PERTURB_BATCH": "88",
+
+        # --- runtime knobs ---
+        "TRANSFORMERS_VERBOSITY": "error",
+        "TOKENIZERS_PARALLELISM": "false",
+        "DIME_TEMP_AUDIO_DIR": "/dev/shm/dime_audio_tmp",
+
+        # ==========================================================
+        # audioLIME / Demucs
+        # ==========================================================
+        "DIME_AUDIO_FEATURE_MODE": "audiolime_demucs",
+        "DIME_AUDIOLIME_DEMUCS_MODEL": "htdemucs",
+        "DIME_AUDIOLIME_USE_PRECOMPUTED": "1",
+        "DIME_AUDIOLIME_PRECOMPUTED_DIR": "/nas/home/fingenito/Thesis_project/QA_analysis/data/demucs_cache",
+        "DIME_AUDIOLIME_RECOMPUTE": "0",
+
+        "DIME_AUDIOLIME_DEMUCS_DEVICE": "cpu",
+        "DIME_AUDIOLIME_DEMUCS_SEGMENT": "8",
+        "DIME_AUDIOLIME_DEMUCS_SHIFTS": "0",
+        "DIME_AUDIOLIME_DEMUCS_SPLIT": "1",
+        "DIME_AUDIOLIME_DEMUCS_OVERLAP": "0.25",
+        "DIME_AUDIOLIME_DEMUCS_JOBS": "0",
+        "DIME_AUDIOLIME_DEMUCS_PROGRESS": "0",
+
+        "DIME_AUDIOLIME_SEGMENTATION_MODE": "onset_guided",
+        "DIME_AUDIOLIME_ONSET_MIN_SEGMENT_SEC": "1.5",
+        "DIME_AUDIOLIME_ONSET_MAX_SEGMENT_SEC": "10.0",
+        "DIME_AUDIOLIME_ONSET_BACKTRACK": "1",
+
+        "DIME_AUDIOLIME_NUM_TEMPORAL_SEGMENTS": "8",
+        "DIME_AUDIOLIME_MAX_FEATURES": "40",
+
+        "DIME_AUDIOLIME_MIN_R2": "0.25",
+        "DIME_AUDIOLIME_SAVE_DEBUG_AUDIO": "0",
+        "DIME_AUDIOLIME_DEBUG_AUDIO_DIR": "",
+        "DIME_AUDIOLIME_NORMALIZE_COMPOSITION": "1",
+        "DIME_AUDIOLIME_PEAK_TARGET": "0.95",
+
+        # ==========================================================
+        # LIME
+        # ==========================================================
+        "DIME_LIME_KERNEL_WIDTH": "0.25",
+        "DIME_LIME_NUM_FEATURES_AUDIO": "16",
+        "DIME_LIME_NUM_FEATURES_TEXT": "10",
+
+        "DIME_NUM_LIME_SAMPLES": "512",
+
+        # ==========================================================
+        # MM-SHAP scheduling
+        # ==========================================================
+        "MMSHAP_QUEUE_WINDOW": "32",
+
+        # ==========================================================
+        # Worker runtime / cleanup
+        # ==========================================================
+        # svuota cache ogni tanto ma non troppo spesso
+        "DIME_WORKER_EMPTYCACHE_EVERY": "24",
+
+        # --- reproducibility / debug ---
+        "DIME_FAST_DEBUG": "0",
+        "DIME_DETERMINISTIC": "0",
+
+        # --- torch runtime ---
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:96",
+        "TF_ENABLE_ONEDNN_OPTS": "0",
+
+        # Thread CPU per worker: con 6 processi è meglio limitarli
+        "OMP_NUM_THREADS": "2",
+        "MKL_NUM_THREADS": "2",
+        "NUMEXPR_NUM_THREADS": "2",
+
+        # --- quiet / console noise suppression ---
+        "PYTHONWARNINGS": "ignore",
+        "BITSANDBYTES_NOWELCOME": "1",
+        "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+        "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
+        "TQDM_DISABLE": "1",
+    }
+
+##6 GPU
+env_cfg = {
+    "TRANSFORMERS_NO_TF": "1",
+
+    "DIME_BG_AUDIO_DIR": "/nas/home/fingenito/HumMusQA/mtg-upf___hum_mus_qa/default/0.0.0/ca7bad071bde0b27e55eca050f2e88b49ae01f56",
+    "TF_CPP_MIN_LOG_LEVEL": "3",
+    "DIME_VALUE_MODE": "logit",
+    "DIME_PROMPTS_FILE": "",
+
+    "DIME_NUM_EXPECTATION_SAMPLES": "16",
+
+    "DIME_QUEUE_WINDOW": "144",
+    "DIME_L_BATCH_SIZE": "12",
+    "DIME_LIME_BATCH_SIZE": "16",
+    "DIME_STEP5_AUDIO_PERTURB_BATCH": "72",
+    "DIME_STEP5_TEXT_PERTURB_BATCH": "96",
+
+    "TRANSFORMERS_VERBOSITY": "error",
+    "TOKENIZERS_PARALLELISM": "false",
+    "DIME_TEMP_AUDIO_DIR": "/dev/shm/dime_audio_tmp",
+
+    "DIME_AUDIO_FEATURE_MODE": "audiolime_demucs",
+    "DIME_AUDIOLIME_DEMUCS_MODEL": "htdemucs",
+    "DIME_AUDIOLIME_USE_PRECOMPUTED": "1",
+    "DIME_AUDIOLIME_PRECOMPUTED_DIR": "/nas/home/fingenito/Thesis_project/QA_analysis/data/demucs_cache",
+    "DIME_AUDIOLIME_RECOMPUTE": "0",
+
+    "DIME_AUDIOLIME_DEMUCS_DEVICE": "cpu",
+    "DIME_AUDIOLIME_DEMUCS_SEGMENT": "8",
+    "DIME_AUDIOLIME_DEMUCS_SHIFTS": "0",
+    "DIME_AUDIOLIME_DEMUCS_SPLIT": "1",
+    "DIME_AUDIOLIME_DEMUCS_OVERLAP": "0.25",
+    "DIME_AUDIOLIME_DEMUCS_JOBS": "0",
+    "DIME_AUDIOLIME_DEMUCS_PROGRESS": "0",
+
+    "DIME_AUDIOLIME_SEGMENTATION_MODE": "onset_guided",
+    "DIME_AUDIOLIME_ONSET_MIN_SEGMENT_SEC": "1.5",
+    "DIME_AUDIOLIME_ONSET_MAX_SEGMENT_SEC": "10.0",
+    "DIME_AUDIOLIME_ONSET_BACKTRACK": "1",
+
+    "DIME_AUDIOLIME_NUM_TEMPORAL_SEGMENTS": "8",
+    "DIME_AUDIOLIME_MAX_FEATURES": "40",
+
+    "DIME_AUDIOLIME_MIN_R2": "0.25",
+    "DIME_AUDIOLIME_SAVE_DEBUG_AUDIO": "0",
+    "DIME_AUDIOLIME_DEBUG_AUDIO_DIR": "",
+    "DIME_AUDIOLIME_NORMALIZE_COMPOSITION": "1",
+    "DIME_AUDIOLIME_PEAK_TARGET": "0.95",
+
+    "DIME_LIME_KERNEL_WIDTH": "0.25",
+    "DIME_LIME_NUM_FEATURES_AUDIO": "16",
+    "DIME_LIME_NUM_FEATURES_TEXT": "10",
+    "DIME_NUM_LIME_SAMPLES": "512",
+
+    "MMSHAP_QUEUE_WINDOW": "36",
+
+    "DIME_WORKER_EMPTYCACHE_EVERY": "20",
+
+    "DIME_FAST_DEBUG": "0",
+    "DIME_DETERMINISTIC": "0",
+
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:128",
+    "TF_ENABLE_ONEDNN_OPTS": "0",
+
+    "OMP_NUM_THREADS": "2",
+    "MKL_NUM_THREADS": "2",
+    "NUMEXPR_NUM_THREADS": "2",
+
+    "PYTHONWARNINGS": "ignore",
+    "BITSANDBYTES_NOWELCOME": "1",
+    "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+    "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
+    "TQDM_DISABLE": "1",
+}
+
+8 GPU
+env_cfg = {
+    "TRANSFORMERS_NO_TF": "1",
+
+    "DIME_BG_AUDIO_DIR": "/nas/home/fingenito/HumMusQA/mtg-upf___hum_mus_qa/default/0.0.0/ca7bad071bde0b27e55eca050f2e88b49ae01f56",
+    "TF_CPP_MIN_LOG_LEVEL": "3",
+    "DIME_VALUE_MODE": "logit",
+    "DIME_PROMPTS_FILE": "",
+
+    "DIME_NUM_EXPECTATION_SAMPLES": "16",
+
+    "DIME_QUEUE_WINDOW": "144",
+    "DIME_L_BATCH_SIZE": "12",
+    "DIME_LIME_BATCH_SIZE": "16",
+    "DIME_STEP5_AUDIO_PERTURB_BATCH": "72",
+    "DIME_STEP5_TEXT_PERTURB_BATCH": "96",
+
+    "TRANSFORMERS_VERBOSITY": "error",
+    "TOKENIZERS_PARALLELISM": "false",
+    "DIME_TEMP_AUDIO_DIR": "/dev/shm/dime_audio_tmp",
+
+    "DIME_AUDIO_FEATURE_MODE": "audiolime_demucs",
+    "DIME_AUDIOLIME_DEMUCS_MODEL": "htdemucs",
+    "DIME_AUDIOLIME_USE_PRECOMPUTED": "1",
+    "DIME_AUDIOLIME_PRECOMPUTED_DIR": "/nas/home/fingenito/Thesis_project/QA_analysis/data/demucs_cache",
+    "DIME_AUDIOLIME_RECOMPUTE": "0",
+
+    "DIME_AUDIOLIME_DEMUCS_DEVICE": "cpu",
+    "DIME_AUDIOLIME_DEMUCS_SEGMENT": "8",
+    "DIME_AUDIOLIME_DEMUCS_SHIFTS": "0",
+    "DIME_AUDIOLIME_DEMUCS_SPLIT": "1",
+    "DIME_AUDIOLIME_DEMUCS_OVERLAP": "0.25",
+    "DIME_AUDIOLIME_DEMUCS_JOBS": "0",
+    "DIME_AUDIOLIME_DEMUCS_PROGRESS": "0",
+
+    "DIME_AUDIOLIME_SEGMENTATION_MODE": "onset_guided",
+    "DIME_AUDIOLIME_ONSET_MIN_SEGMENT_SEC": "1.5",
+    "DIME_AUDIOLIME_ONSET_MAX_SEGMENT_SEC": "10.0",
+    "DIME_AUDIOLIME_ONSET_BACKTRACK": "1",
+
+    "DIME_AUDIOLIME_NUM_TEMPORAL_SEGMENTS": "8",
+    "DIME_AUDIOLIME_MAX_FEATURES": "40",
+
+    "DIME_AUDIOLIME_MIN_R2": "0.25",
+    "DIME_AUDIOLIME_SAVE_DEBUG_AUDIO": "0",
+    "DIME_AUDIOLIME_DEBUG_AUDIO_DIR": "",
+    "DIME_AUDIOLIME_NORMALIZE_COMPOSITION": "1",
+    "DIME_AUDIOLIME_PEAK_TARGET": "0.95",
+
+    "DIME_LIME_KERNEL_WIDTH": "0.25",
+    "DIME_LIME_NUM_FEATURES_AUDIO": "16",
+    "DIME_LIME_NUM_FEATURES_TEXT": "10",
+    "DIME_NUM_LIME_SAMPLES": "512",
+
+    "MMSHAP_QUEUE_WINDOW": "36",
+
+    "DIME_WORKER_EMPTYCACHE_EVERY": "20",
+
+    "DIME_FAST_DEBUG": "0",
+    "DIME_DETERMINISTIC": "0",
+
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:128",
+    "TF_ENABLE_ONEDNN_OPTS": "0",
+
+    "OMP_NUM_THREADS": "2",
+    "MKL_NUM_THREADS": "2",
+    "NUMEXPR_NUM_THREADS": "2",
+
+    "PYTHONWARNINGS": "ignore",
+    "BITSANDBYTES_NOWELCOME": "1",
+    "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+    "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
+    "TQDM_DISABLE": "1",
+}
