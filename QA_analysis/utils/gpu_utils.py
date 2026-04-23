@@ -346,100 +346,10 @@ def _worker_loop(
     torch.set_grad_enabled(False)
 
     from QA_analysis.utils.analysis_2 import dime_token_value
-    from QA_analysis.utils.shared_utils import (
-        prepare_qwen25_omni_inputs,
-        get_token_logit_autoregressive_id_batch,
-    )
+    from QA_analysis.utils.shared_utils import prepare_qwen25_omni_inputs
 
     CACHE_EVERY_N_TASKS = int(os.environ.get("DIME_WORKER_EMPTYCACHE_EVERY", "0"))
     task_counter = 0
-
-    TRUE_BATCH_SIZE = max(1, int(os.environ.get("DIME_QWEN_TRUE_BATCH_SIZE", "4")))
-
-    def _eval_dime_items_serial(items: List[Dict[str, Any]]) -> List[float]:
-        vals = []
-        for item in items:
-            with torch.inference_mode():
-                v = dime_token_value(
-                    model=model,
-                    processor=processor,
-                    audio_path=item["audio_path"],
-                    prompt=item["prompt"],
-                    caption_ids=item["caption_ids"],
-                    token_index=int(item["token_index"]),
-                )
-            vals.append(float(v))
-        return vals
-
-    def _eval_dime_items_batched_once(items: List[Dict[str, Any]]) -> List[float]:
-        """
-        Un singolo forward batchato Qwen per un micro-batch di esempi.
-        """
-        batch_payload = []
-        for item in items:
-            caption_ids = item["caption_ids"]
-            token_index = int(item["token_index"])
-            target_id = int(caption_ids[token_index])
-            prefix_ids = caption_ids[:token_index]
-
-            batch_payload.append({
-                "audio_path": item["audio_path"],
-                "prompt": item["prompt"],
-                "prefix_ids": prefix_ids,
-                "target_id": target_id,
-            })
-
-        return get_token_logit_autoregressive_id_batch(
-            model=model,
-            processor=processor,
-            batch_items=batch_payload,
-        )
-
-    def _eval_dime_items_adaptive(items: List[Dict[str, Any]]) -> List[float]:
-        """
-        Valuta gli item usando vero batching Qwen.
-        Se il micro-batch va in OOM, dimezza ricorsivamente fino al fallback seriale.
-        """
-        if not items:
-            return []
-
-        try:
-            return _eval_dime_items_batched_once(items)
-
-        except torch.cuda.OutOfMemoryError:
-            _cleanup_cuda(force=True)
-
-            if len(items) == 1:
-                return _eval_dime_items_serial(items)
-
-            mid = len(items) // 2
-            left = _eval_dime_items_adaptive(items[:mid])
-            right = _eval_dime_items_adaptive(items[mid:])
-            return left + right
-
-        except RuntimeError as e:
-            msg = str(e).lower()
-            # alcuni errori del processor/model batching si manifestano come RuntimeError
-            if "out of memory" in msg or "cuda" in msg:
-                _cleanup_cuda(force=True)
-                if len(items) == 1:
-                    return _eval_dime_items_serial(items)
-                mid = len(items) // 2
-                left = _eval_dime_items_adaptive(items[:mid])
-                right = _eval_dime_items_adaptive(items[mid:])
-                return left + right
-            raise
-
-    def _eval_dime_items_chunked(items: List[Dict[str, Any]]) -> List[float]:
-        """
-        Spezza il task in micro-batch reali di dimensione TRUE_BATCH_SIZE.
-        Ogni micro-batch prova un vero forward batchato.
-        """
-        out: List[float] = []
-        for b0 in range(0, len(items), TRUE_BATCH_SIZE):
-            chunk = items[b0:b0 + TRUE_BATCH_SIZE]
-            out.extend(_eval_dime_items_adaptive(chunk))
-        return out
 
     def _cleanup_cuda(force: bool = False):
         nonlocal task_counter
@@ -490,15 +400,21 @@ def _worker_loop(
                 prompts = task.payload["prompts"]
                 ij_list = task.payload["ij_list"]
                 batch_id = int(task.payload["batch_id"])
-                items = []
+
+                vals = []
                 for (i, j) in ij_list:
-                    items.append({
-                        "audio_path": audio_paths[int(i)],
-                        "prompt": prompts[int(j)],
-                        "caption_ids": caption_ids,
-                        "token_index": token_index,
-                    })
-                vals = _eval_dime_items_chunked(items)
+                    ai = audio_paths[int(i)]
+                    tj = prompts[int(j)]
+                    with torch.inference_mode():
+                        v = dime_token_value(
+                            model=model,
+                            processor=processor,
+                            audio_path=ai,
+                            prompt=tj,
+                            caption_ids=caption_ids,
+                            token_index=token_index,
+                        )
+                    vals.append(float(v))
 
                 result_q.put(("dime_L_batch", {
                     "req_id": req_id,
@@ -508,32 +424,29 @@ def _worker_loop(
                 }))
                 _cleanup_cuda(force=False)
 
-
             elif task.kind == "dime_row_values_batch":
                 caption_ids = task.payload["caption_ids"]
                 token_index = int(task.payload["token_index"])
                 audio_paths = task.payload["audio_paths"]
                 prompts = task.payload["prompts"]
                 batch_id = int(task.payload["batch_id"])
-                items = []
-                shape = []
-                for ap in audio_paths:
-                    row_len = 0
-                    for p in prompts:
-                        items.append({
-                            "audio_path": ap,
-                            "prompt": p,
-                            "caption_ids": caption_ids,
-                            "token_index": token_index,
-                        })
-                        row_len += 1
-                    shape.append(row_len)
-                flat_vals = _eval_dime_items_chunked(items)
+
                 rows = []
-                cursor = 0
-                for row_len in shape:
-                    rows.append([float(x) for x in flat_vals[cursor:cursor + row_len]])
-                    cursor += row_len
+                for ap in audio_paths:
+                    row = []
+                    for p in prompts:
+                        with torch.inference_mode():
+                            v = dime_token_value(
+                                model=model,
+                                processor=processor,
+                                audio_path=ap,
+                                prompt=p,
+                                caption_ids=caption_ids,
+                                token_index=token_index,
+                            )
+                        row.append(float(v))
+                    rows.append(row)
+
                 result_q.put(("dime_row_values_batch", {
                     "req_id": req_id,
                     "batch_id": batch_id,
@@ -547,25 +460,23 @@ def _worker_loop(
                 audio_paths = task.payload["audio_paths"]
                 prompts = task.payload["prompts"]
                 batch_id = int(task.payload["batch_id"])
-                items = []
-                shape = []
-                for p in prompts:
-                    col_len = 0
-                    for ap in audio_paths:
-                        items.append({
-                            "audio_path": ap,
-                            "prompt": p,
-                            "caption_ids": caption_ids,
-                            "token_index": token_index,
-                        })
-                        col_len += 1
-                    shape.append(col_len)
-                flat_vals = _eval_dime_items_chunked(items)
+
                 cols = []
-                cursor = 0
-                for col_len in shape:
-                    cols.append([float(x) for x in flat_vals[cursor:cursor + col_len]])
-                    cursor += col_len
+                for p in prompts:
+                    col = []
+                    for ap in audio_paths:
+                        with torch.inference_mode():
+                            v = dime_token_value(
+                                model=model,
+                                processor=processor,
+                                audio_path=ap,
+                                prompt=p,
+                                caption_ids=caption_ids,
+                                token_index=token_index,
+                            )
+                        col.append(float(v))
+                    cols.append(col)
+
                 result_q.put(("dime_col_values_batch", {
                     "req_id": req_id,
                     "batch_id": batch_id,

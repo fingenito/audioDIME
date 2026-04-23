@@ -47,9 +47,9 @@ def _apply_reproducible_env() -> None:
         # ==========================================================
         "DIME_QUEUE_WINDOW": "128",  # ↑ più lavoro pronto
         "DIME_L_BATCH_SIZE": "8",  # ↓ più granularità
-        "DIME_LIME_BATCH_SIZE": "10",  # ↓ meno stragglers
-        "DIME_QWEN_TRUE_BATCH_SIZE": "4",
-        "DIME_STEP5_AUDIO_PERTURB_BATCH": "80",  # ↓ task più piccoli
+        "DIME_LIME_BATCH_SIZE": "8",  # ↓ meno stragglers
+
+        "DIME_STEP5_AUDIO_PERTURB_BATCH": "88",  # ↓ task più piccoli
         "DIME_STEP5_TEXT_PERTURB_BATCH": "120",
 
         # ==========================================================
