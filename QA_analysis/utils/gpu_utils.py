@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import sys
 import warnings
 import contextlib
+from multiprocessing import shared_memory
 
 logger = logging.getLogger("GPU Utils")
 
@@ -91,7 +92,6 @@ def _configure_worker_quiet_mode() -> None:
     except Exception:
         pass
 
-
 @contextlib.contextmanager
 def _suppress_stdout_stderr():
     """
@@ -147,7 +147,6 @@ def configure_runtime() -> None:
     except Exception:
         pass
 
-
 # ==========================================================
 # GPU inventory
 # ==========================================================
@@ -186,7 +185,6 @@ def get_gpu_inventory() -> List[Dict[str, Any]]:
         logger.warning(f"Impossibile usare nvidia-smi per inventario GPU: {e}")
         return []
 
-
 def get_available_gpus_with_memory(
     min_free_memory_gb: float = 20.0,
     allowed_gpu_ids: Optional[List[int]] = None,
@@ -221,7 +219,6 @@ def get_available_gpus_with_memory(
         logger.warning(f"Impossibile rilevare memoria GPU: {e}")
         return [], []
 
-
 # ==========================================================
 # Task protocol
 # ==========================================================
@@ -230,11 +227,10 @@ class Task:
     kind: str
     payload: dict
 
-
 # ==========================================================
 # Qwen2.5-Omni helpers
 # ==========================================================
-def _build_messages(audio_path: str, prompt: str):
+def _build_messages(audio_path: Any, prompt: str):
     return [
         {
             "role": "user",
@@ -244,7 +240,6 @@ def _build_messages(audio_path: str, prompt: str):
             ],
         }
     ]
-
 
 def _trim_generated_ids_at_first_im_end(gen_ids_1d, processor):
     ids = gen_ids_1d.detach().clone()
@@ -265,43 +260,98 @@ def _trim_generated_ids_at_first_im_end(gen_ids_1d, processor):
 
     return ids[:cut]
 
+def _is_shared_memory_audio_descriptor(x: Any) -> bool:
+    return isinstance(x, dict) and x.get("kind") == "shared_memory_audio"
 
-def _generate_text_response_qwen25_omni(model, processor, audio_path: str, prompt: str) -> str:
+def _is_inline_audio_descriptor(x: Any) -> bool:
+    return isinstance(x, dict) and (
+        x.get("kind") == "inline_audio" or ("array" in x and "sampling_rate" in x)
+    )
+
+def _materialize_worker_audio_input(audio_obj: Any) -> Tuple[Any, Optional[shared_memory.SharedMemory]]:
+    """
+    Converte l'oggetto ricevuto dal main in un input consumabile da Qwen nel worker.
+
+    Ritorna:
+      - audio_input pronto per shared_utils._build_qwen25_audio_messages / prepare_qwen25_omni_inputs
+      - eventuale handle SharedMemory da chiudere dopo l'uso
+
+    FIX Level-1:
+    - per shared_memory NON facciamo copy() immediata;
+    - manteniamo vivo l'handle fino a fine uso;
+    - prepare_qwen25_omni_inputs consumerà il buffer durante la chiamata.
+    """
+    import numpy as np
+
+    if _is_shared_memory_audio_descriptor(audio_obj):
+        shm_name = str(audio_obj["shm_name"])
+        shape = tuple(int(x) for x in audio_obj["shape"])
+        dtype = np.dtype(str(audio_obj["dtype"]))
+        sr = int(audio_obj["sampling_rate"])
+
+        shm = shared_memory.SharedMemory(name=shm_name)
+        arr_view = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+
+        return {
+            "array": arr_view,   # zero-copy view sul buffer shared memory
+            "sampling_rate": sr,
+        }, shm
+
+    if _is_inline_audio_descriptor(audio_obj):
+        return {
+            "array": np.asarray(audio_obj["array"], dtype=np.float32).reshape(-1),
+            "sampling_rate": int(audio_obj["sampling_rate"]),
+        }, None
+
+    return audio_obj, None
+
+def _close_worker_audio_handle(handle: Optional[shared_memory.SharedMemory]) -> None:
+    if handle is None:
+        return
+    try:
+        handle.close()
+    except Exception:
+        pass
+
+def _generate_text_response_qwen25_omni(model, processor, audio_path: Any, prompt: str) -> str:
     import torch
     from QA_analysis.utils.shared_utils import prepare_qwen25_omni_inputs
 
-    messages = _build_messages(audio_path, prompt)
+    audio_input, shm_handle = _materialize_worker_audio_input(audio_path)
+    try:
+        messages = _build_messages(audio_input, prompt)
 
-    _text, inputs = prepare_qwen25_omni_inputs(
-        processor=processor,
-        conversation=messages,
-        device=model.device,
-        dtype=getattr(model, "dtype", None),
-        use_audio_in_video=False,
-    )
-
-    with torch.inference_mode():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=16,
-            return_dict_in_generate=True,
-            output_scores=False,
-            output_logits=False,
-            use_cache=False,
+        _text, inputs = prepare_qwen25_omni_inputs(
+            processor=processor,
+            conversation=messages,
+            device=model.device,
+            dtype=getattr(model, "dtype", None),
+            use_audio_in_video=False,
         )
 
-    sequences = outputs.sequences
-    input_len = int(inputs["input_ids"].shape[1])
-    gen_ids = sequences[0, input_len:]
-    gen_ids = _trim_generated_ids_at_first_im_end(gen_ids, processor)
+        with torch.inference_mode():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=16,
+                return_dict_in_generate=True,
+                output_scores=False,
+                output_logits=False,
+                use_cache=False,
+            )
 
-    text_out = processor.tokenizer.decode(
-        gen_ids.detach().cpu().tolist(),
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )
-    return str(text_out).strip()
+        sequences = outputs.sequences
+        input_len = int(inputs["input_ids"].shape[1])
+        gen_ids = sequences[0, input_len:]
+        gen_ids = _trim_generated_ids_at_first_im_end(gen_ids, processor)
 
+        text_out = processor.tokenizer.decode(
+            gen_ids.detach().cpu().tolist(),
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        return str(text_out).strip()
+    finally:
+        _close_worker_audio_handle(shm_handle)
 # ==========================================================
 # Worker
 # ==========================================================
@@ -393,6 +443,42 @@ def _worker_loop(
                 }))
                 _cleanup_cuda(force=False)
 
+            elif task.kind == "dime_probe_audio_io":
+                caption_ids = task.payload["caption_ids"]
+                token_index = int(task.payload["token_index"])
+                file_audio_path = task.payload["file_audio_path"]
+                inline_audio = task.payload["inline_audio"]
+                prompt = task.payload["prompt"]
+                inline_audio_input, inline_handle = _materialize_worker_audio_input(inline_audio)
+                try:
+                    with torch.inference_mode():
+                        v_file = dime_token_value(
+                            model=model,
+                            processor=processor,
+                            audio_path=file_audio_path,
+                            prompt=prompt,
+                            caption_ids=caption_ids,
+                            token_index=token_index,
+                        )
+                    with torch.inference_mode():
+                        v_inline = dime_token_value(
+                            model=model,
+                            processor=processor,
+                            audio_path=inline_audio_input,
+                            prompt=prompt,
+                            caption_ids=caption_ids,
+                            token_index=token_index,
+                        )
+
+                finally:
+                    _close_worker_audio_handle(inline_handle)
+                result_q.put(("dime_probe_audio_io", {
+                    "req_id": req_id,
+                    "file_value": float(v_file),
+                    "inline_value": float(v_inline),
+                }))
+                _cleanup_cuda(force=False)
+
             elif task.kind == "dime_L_batch":
                 caption_ids = task.payload["caption_ids"]
                 token_index = int(task.payload["token_index"])
@@ -403,17 +489,23 @@ def _worker_loop(
 
                 vals = []
                 for (i, j) in ij_list:
-                    ai = audio_paths[int(i)]
+                    ai_raw = audio_paths[int(i)]
                     tj = prompts[int(j)]
-                    with torch.inference_mode():
-                        v = dime_token_value(
-                            model=model,
-                            processor=processor,
-                            audio_path=ai,
-                            prompt=tj,
-                            caption_ids=caption_ids,
-                            token_index=token_index,
-                        )
+
+                    ai, ai_handle = _materialize_worker_audio_input(ai_raw)
+                    try:
+                        with torch.inference_mode():
+                            v = dime_token_value(
+                                model=model,
+                                processor=processor,
+                                audio_path=ai,
+                                prompt=tj,
+                                caption_ids=caption_ids,
+                                token_index=token_index,
+                            )
+                    finally:
+                        _close_worker_audio_handle(ai_handle)
+
                     vals.append(float(v))
 
                 result_q.put(("dime_L_batch", {
@@ -432,20 +524,24 @@ def _worker_loop(
                 batch_id = int(task.payload["batch_id"])
 
                 rows = []
-                for ap in audio_paths:
-                    row = []
-                    for p in prompts:
-                        with torch.inference_mode():
-                            v = dime_token_value(
-                                model=model,
-                                processor=processor,
-                                audio_path=ap,
-                                prompt=p,
-                                caption_ids=caption_ids,
-                                token_index=token_index,
-                            )
-                        row.append(float(v))
-                    rows.append(row)
+                for ap_raw in audio_paths:
+                    ap, ap_handle = _materialize_worker_audio_input(ap_raw)
+                    try:
+                        row = []
+                        for p in prompts:
+                            with torch.inference_mode():
+                                v = dime_token_value(
+                                    model=model,
+                                    processor=processor,
+                                    audio_path=ap,
+                                    prompt=p,
+                                    caption_ids=caption_ids,
+                                    token_index=token_index,
+                                )
+                            row.append(float(v))
+                        rows.append(row)
+                    finally:
+                        _close_worker_audio_handle(ap_handle)
 
                 result_q.put(("dime_row_values_batch", {
                     "req_id": req_id,
@@ -464,16 +560,21 @@ def _worker_loop(
                 cols = []
                 for p in prompts:
                     col = []
-                    for ap in audio_paths:
-                        with torch.inference_mode():
-                            v = dime_token_value(
-                                model=model,
-                                processor=processor,
-                                audio_path=ap,
-                                prompt=p,
-                                caption_ids=caption_ids,
-                                token_index=token_index,
-                            )
+                    for ap_raw in audio_paths:
+                        ap, ap_handle = _materialize_worker_audio_input(ap_raw)
+                        try:
+                            with torch.inference_mode():
+                                v = dime_token_value(
+                                    model=model,
+                                    processor=processor,
+                                    audio_path=ap,
+                                    prompt=p,
+                                    caption_ids=caption_ids,
+                                    token_index=token_index,
+                                )
+                        finally:
+                            _close_worker_audio_handle(ap_handle)
+
                         col.append(float(v))
                     cols.append(col)
 
@@ -484,41 +585,40 @@ def _worker_loop(
                 }))
                 _cleanup_cuda(force=False)
 
-
             elif task.kind == "mmshap_logits":
-                audio_path = task.payload["audio_path"]
+                audio_path_raw = task.payload["audio_path"]
                 prompt = task.payload["prompt"]
                 target_ids = task.payload["target_ids"]
                 batch_id = task.payload.get("batch_id", None)
-                messages = _build_messages(audio_path, prompt)
-
-                _text, inputs = prepare_qwen25_omni_inputs(
-                    processor=processor,
-                    conversation=messages,
-                    device=model.device,
-                    dtype=getattr(model, "dtype", None),
-                    use_audio_in_video=False,
-                )
-                with torch.inference_mode():
-                    outputs = model.generate(
-                        **inputs,
-                        max_new_tokens=max(1, len(target_ids) + 2),
-                        return_dict_in_generate=True,
-                        output_logits=True,
-                        use_cache=False,
+                audio_path, audio_handle = _materialize_worker_audio_input(audio_path_raw)
+                try:
+                    messages = _build_messages(audio_path, prompt)
+                    _text, inputs = prepare_qwen25_omni_inputs(
+                        processor=processor,
+                        conversation=messages,
+                        device=model.device,
+                        dtype=getattr(model, "dtype", None),
+                        use_audio_in_video=False,
                     )
-
-                step_logits = torch.stack([x[0] for x in outputs.logits], dim=0)
-                T = min(step_logits.shape[0], len(target_ids))
-                vals = []
-
-                for t in range(T):
-                    tid = int(target_ids[t])
-                    if 0 <= tid < step_logits.shape[1]:
-                        vals.append(float(step_logits[t, tid].item()))
-                    else:
-                        vals.append(float(step_logits[t].mean().item()))
-
+                    with torch.inference_mode():
+                        outputs = model.generate(
+                            **inputs,
+                            max_new_tokens=max(1, len(target_ids) + 2),
+                            return_dict_in_generate=True,
+                            output_logits=True,
+                            use_cache=False,
+                        )
+                    step_logits = torch.stack([x[0] for x in outputs.logits], dim=0)
+                    T = min(step_logits.shape[0], len(target_ids))
+                    vals = []
+                    for t in range(T):
+                        tid = int(target_ids[t])
+                        if 0 <= tid < step_logits.shape[1]:
+                            vals.append(float(step_logits[t, tid].item()))
+                        else:
+                            vals.append(float(step_logits[t].mean().item()))
+                finally:
+                    _close_worker_audio_handle(audio_handle)
                 result_q.put(("mmshap_logits", {
                     "req_id": req_id,
                     "batch_id": batch_id,
@@ -784,6 +884,37 @@ class ParallelTokenRunner:
 
         return [x if x is not None else "" for x in out]
 
+    def probe_step4a_audio_equivalence(
+        self,
+        file_audio_path: str,
+        inline_audio: Dict[str, Any],
+        prompt: str,
+        caption_ids: List[int],
+        token_index: int,
+    ) -> Dict[str, float]:
+        req_id = self._new_req_id()
+
+        self._put_task(
+            "dime_probe_audio_io",
+            {
+                "file_audio_path": file_audio_path,
+                "inline_audio": inline_audio,
+                "prompt": prompt,
+                "caption_ids": list(caption_ids),
+                "token_index": int(token_index),
+            },
+            req_id=req_id,
+        )
+
+        kind, payload = self._get_for_req(req_id)
+        if kind != "dime_probe_audio_io":
+            raise RuntimeError(f"Unexpected response kind for probe_step4a_audio_equivalence: {kind}")
+
+        return {
+            "file_value": float(payload["file_value"]),
+            "inline_value": float(payload["inline_value"]),
+        }
+
     def run_dime_L_table(
         self,
         bg_audio_paths: List[str],
@@ -836,7 +967,7 @@ class ParallelTokenRunner:
 
     def run_dime_row_values(
         self,
-        audio_paths: List[str],
+        audio_paths: List[Any],
         prompts: List[str],
         caption_ids: List[int],
         token_index: int,
@@ -919,7 +1050,6 @@ class ParallelTokenRunner:
         for chunk_cols in out:
             cols.extend(chunk_cols)
         return cols
-
 
 # ==========================================================
 # factory

@@ -35,7 +35,7 @@ def _apply_reproducible_env() -> None:
         "DIME_PROMPTS_FILE": "",
 
         # ==========================================================
-        # 🔵 QUALITY (NON TOCCATA)
+        # QUALITY
         # ==========================================================
         "DIME_NUM_EXPECTATION_SAMPLES": "16",
         "DIME_NUM_LIME_SAMPLES": "512",
@@ -43,17 +43,17 @@ def _apply_reproducible_env() -> None:
         "DIME_LIME_NUM_FEATURES_TEXT": "10",
 
         # ==========================================================
-        # ⚡ SCHEDULING (OTTIMIZZATO)
+        # SCHEDULING / BATCHING
         # ==========================================================
-        "DIME_QUEUE_WINDOW": "128",  # ↑ più lavoro pronto
-        "DIME_L_BATCH_SIZE": "8",  # ↓ più granularità
-        "DIME_LIME_BATCH_SIZE": "8",  # ↓ meno stragglers
+        "DIME_QUEUE_WINDOW": "160",
+        "DIME_L_BATCH_SIZE": "8",
+        "DIME_LIME_BATCH_SIZE": "8",
 
-        "DIME_STEP5_AUDIO_PERTURB_BATCH": "88",  # ↓ task più piccoli
-        "DIME_STEP5_TEXT_PERTURB_BATCH": "120",
+        "DIME_STEP5_AUDIO_PERTURB_BATCH": "64",
+        "DIME_STEP5_TEXT_PERTURB_BATCH": "128",
 
         # ==========================================================
-        # ⚡ AUDIO / DEMUCS
+        # AUDIO / DEMUCS
         # ==========================================================
         "DIME_AUDIO_FEATURE_MODE": "audiolime_demucs",
         "DIME_AUDIOLIME_DEMUCS_MODEL": "htdemucs",
@@ -62,32 +62,48 @@ def _apply_reproducible_env() -> None:
         "DIME_AUDIOLIME_PRECOMPUTED_DIR": "/nas/home/fingenito/Thesis_project/QA_analysis/data/demucs_cache",
         "DIME_AUDIOLIME_DEMUCS_DEVICE": "cpu",
 
-        "DIME_AUDIOLIME_DEMUCS_SEGMENT": "8",  # ✔ già ottimo
+        "DIME_AUDIOLIME_DEMUCS_SEGMENT": "8",
         "DIME_AUDIOLIME_DEMUCS_SPLIT": "1",
         "DIME_AUDIOLIME_DEMUCS_OVERLAP": "0.25",
 
         # ==========================================================
-        # ⚡ AUDIO FEATURES
+        # AUDIO FEATURES
         # ==========================================================
         "DIME_AUDIOLIME_NUM_TEMPORAL_SEGMENTS": "8",
         "DIME_AUDIOLIME_MAX_FEATURES": "40",
         "DIME_AUDIOLIME_MIN_R2": "0.25",
 
         # ==========================================================
-        # ⚡ MM-SHAP
+        # MM-SHAP
         # ==========================================================
-        "MMSHAP_QUEUE_WINDOW": "48",  # ↑ migliora parallelismo
+        "MMSHAP_QUEUE_WINDOW": "64",
 
         # ==========================================================
-        # ⚡ MEMORY / STABILITY
+        # MEMORY / STABILITY
         # ==========================================================
-        "DIME_WORKER_EMPTYCACHE_EVERY": "32",  # ↓ overhead
+        "DIME_WORKER_EMPTYCACHE_EVERY": "96",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:128",
+        "DIME_STEP4A_AUDIO_IO_MODE": "auto",
+        "DIME_STEP4A_AUDIO_EQ_ATOL": "1e-5",
+        "DIME_STEP4A_AUDIO_EQ_RTOL": "1e-4",
+        "DIME_STEP4A_RUNNER_AUDIO_TRANSPORT": "shared_memory",
 
         # CPU threads
         "OMP_NUM_THREADS": "2",
         "MKL_NUM_THREADS": "2",
         "NUMEXPR_NUM_THREADS": "2",
+
+        # ==========================================================
+        # CPU / I-O OVERHEAD REDUCTION (Level 1 exact speedup)
+        # ==========================================================
+        "DIME_FIXED_AUDIO_TRANSPORT_CACHE": "1",
+        "DIME_FIXED_AUDIO_TRANSPORT_MODE": "shared_memory",  # shared_memory | inline | off
+        "DIME_QWEN_TEXT_CACHE_SIZE": "4096",
+
+        # ==========================================================
+        # LEVEL 2: reuse perturbation families across caption tokens
+        # ==========================================================
+        "DIME_REUSE_PERTURBATIONS_ACROSS_TOKENS": "1",
     }
 
     for k, v in env_cfg.items():
@@ -106,6 +122,14 @@ def _collect_reproducible_env_snapshot() -> Dict[str, str]:
     Salva TUTTE le env rilevanti al run, non solo un sottoinsieme.
     """
     keys = [
+        "DIME_REUSE_PERTURBATIONS_ACROSS_TOKENS",
+        "DIME_FIXED_AUDIO_TRANSPORT_CACHE",
+        "DIME_FIXED_AUDIO_TRANSPORT_MODE",
+        "DIME_QWEN_TEXT_CACHE_SIZE",
+        "DIME_STEP4A_RUNNER_AUDIO_TRANSPORT",
+        "DIME_STEP4A_AUDIO_IO_MODE",
+        "DIME_STEP4A_AUDIO_EQ_ATOL",
+        "DIME_STEP4A_AUDIO_EQ_RTOL",
         "DIME_BG_AUDIO_DIR",
         "DIME_PROMPTS_FILE",
         "DIME_VALUE_MODE",
