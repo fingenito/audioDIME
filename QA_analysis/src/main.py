@@ -27,15 +27,13 @@ def _apply_reproducible_env() -> None:
 
     env_cfg = {
         "TRANSFORMERS_NO_TF": "1",
-
-        # --- base ---
         "DIME_BG_AUDIO_DIR": "...",
         "TF_CPP_MIN_LOG_LEVEL": "3",
         "DIME_VALUE_MODE": "logit",
         "DIME_PROMPTS_FILE": "",
 
         # ==========================================================
-        # QUALITY
+        # QUALITY — invariati, scelta metodologica
         # ==========================================================
         "DIME_NUM_EXPECTATION_SAMPLES": "16",
         "DIME_NUM_LIME_SAMPLES": "512",
@@ -43,17 +41,41 @@ def _apply_reproducible_env() -> None:
         "DIME_LIME_NUM_FEATURES_TEXT": "10",
 
         # ==========================================================
-        # SCHEDULING / BATCHING
+        # SCHEDULING / BATCHING — ottimizzati per 8 GPU
         # ==========================================================
-        "DIME_QUEUE_WINDOW": "160",
+        # QUEUE_WINDOW: più largo = GPUs sempre occupate
+        # Con 8 GPU e task da ~25s ognuno, vogliamo almeno 3-4 wave
+        # pre-queued → 8 GPU × 4 wave = 32 task → ma task size=8 audio
+        # → 32 × 8 = 256 audio pre-queued. Mettiamo 320 per sicurezza.
+        "DIME_QUEUE_WINDOW": "320",  # era 160
+
+        # L_BATCH_SIZE: N=16, 256 pairs totali.
+        # Con batch=8 → 32 chunk → 8 GPU ottengono 4 round ciascuna.
+        # Con batch=16 → 16 chunk → 8 GPU ottengono 2 round.
+        # Più fine-grained = meglio per load balancing → teniamo 8.
         "DIME_L_BATCH_SIZE": "8",
+
+        # LIME_BATCH_SIZE: chunk size per GPU per task.
+        # 8 audio per task × PKV: ~25s per task → ottimale per granularità.
+        # Non aumentare: task più grandi = più code lag.
         "DIME_LIME_BATCH_SIZE": "8",
 
-        "DIME_STEP5_AUDIO_PERTURB_BATCH": "64",
-        "DIME_STEP5_TEXT_PERTURB_BATCH": "128",
+        # INNER_BATCH_SIZE: usato solo nel fallback (PKV disabilitato).
+        # Teniamo 8 come safety net.
+        "DIME_WORKER_INNER_BATCH_SIZE": "8",
+
+        # AUDIO_PERTURB_BATCH: quanti audio perturbati mandare in blocco.
+        # 128 → 128/8 = 16 task chunk → 8 GPU ricevono 2 round di lavoro
+        # pre-caricato → migliore pipeline vs 64 (1 round solo).
+        "DIME_STEP5_AUDIO_PERTURB_BATCH": "128",  # era 64
+
+        # TEXT_PERTURB_BATCH: quanti prompt mascherati mandare in blocco.
+        # 256 → 256/8 = 32 task chunk → 8 GPU × 4 round pre-caricato.
+        # Più granulare = GPU non aspettano mai.
+        "DIME_STEP5_TEXT_PERTURB_BATCH": "256",  # era 128
 
         # ==========================================================
-        # AUDIO / DEMUCS
+        # AUDIO / DEMUCS — invariati
         # ==========================================================
         "DIME_AUDIO_FEATURE_MODE": "audiolime_demucs",
         "DIME_AUDIOLIME_DEMUCS_MODEL": "htdemucs",
@@ -61,47 +83,64 @@ def _apply_reproducible_env() -> None:
         "DIME_AUDIOLIME_RECOMPUTE": "0",
         "DIME_AUDIOLIME_PRECOMPUTED_DIR": "/nas/home/fingenito/Thesis_project/QA_analysis/data/demucs_cache",
         "DIME_AUDIOLIME_DEMUCS_DEVICE": "cpu",
-
         "DIME_AUDIOLIME_DEMUCS_SEGMENT": "8",
         "DIME_AUDIOLIME_DEMUCS_SPLIT": "1",
         "DIME_AUDIOLIME_DEMUCS_OVERLAP": "0.25",
 
         # ==========================================================
-        # AUDIO FEATURES
+        # AUDIO FEATURES — invariati
         # ==========================================================
         "DIME_AUDIOLIME_NUM_TEMPORAL_SEGMENTS": "8",
         "DIME_AUDIOLIME_MAX_FEATURES": "40",
         "DIME_AUDIOLIME_MIN_R2": "0.25",
 
         # ==========================================================
-        # MM-SHAP
+        # MM-SHAP — più finestra per 8 GPU
         # ==========================================================
-        "MMSHAP_QUEUE_WINDOW": "64",
+        "MMSHAP_QUEUE_WINDOW": "128",  # era 64 → 8 GPU × 16 task pre-queued
 
         # ==========================================================
         # MEMORY / STABILITY
         # ==========================================================
-        "DIME_WORKER_EMPTYCACHE_EVERY": "96",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:128",
+        # PKV deepcopy crea molti tensori GPU temporanei.
+        # Cache cleanup ogni 32 task invece di 96 evita OOM per accumulo.
+        "DIME_WORKER_EMPTYCACHE_EVERY": "32",  # era 96
+
+        # max_split_size_mb più grande: deepcopy alloca blocchi ~84MB
+        # → con 128 venivano spezzati. 256 li lascia contigui → meno frammentazione.
+        # garbage_collection_threshold: libera aggressivamente tra le operazioni.
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.8",
+
         "DIME_STEP4A_AUDIO_IO_MODE": "auto",
         "DIME_STEP4A_AUDIO_EQ_ATOL": "1e-5",
         "DIME_STEP4A_AUDIO_EQ_RTOL": "1e-4",
         "DIME_STEP4A_RUNNER_AUDIO_TRANSPORT": "shared_memory",
 
-        # CPU threads
-        "OMP_NUM_THREADS": "2",
-        "MKL_NUM_THREADS": "2",
-        "NUMEXPR_NUM_THREADS": "2",
+        # CPU threads: con PKV cache il CPU fa meno preprocessing.
+        # Possiamo permetterci più thread per il tokenizer/mel spec residuo.
+        "OMP_NUM_THREADS": "4",  # era 2
+        "MKL_NUM_THREADS": "4",  # era 2
+        "NUMEXPR_NUM_THREADS": "4",  # era 2
 
         # ==========================================================
-        # CPU / I-O OVERHEAD REDUCTION (Level 1 exact speedup)
+        # LEVEL 1: transport cache
         # ==========================================================
         "DIME_FIXED_AUDIO_TRANSPORT_CACHE": "1",
-        "DIME_FIXED_AUDIO_TRANSPORT_MODE": "shared_memory",  # shared_memory | inline | off
+        "DIME_FIXED_AUDIO_TRANSPORT_MODE": "shared_memory",
         "DIME_QWEN_TEXT_CACHE_SIZE": "4096",
 
         # ==========================================================
-        # LEVEL 2: reuse perturbation families across caption tokens
+        # LEVEL 3: PKV cache
+        # ==========================================================
+        "DIME_TEXT_PKV_CACHE": "1",
+        "DIME_TEXT_PKV_CACHE_VERIFY": "0",  # CRITICO: verify=1 annulla tutto
+        "DIME_TEXT_PKV_CACHE_MIN_COMMON_PREFIX": "8",
+        "DIME_TEXT_PKV_CACHE_ATOL": "1e-5",
+        "DIME_TEXT_PKV_CACHE_RTOL": "1e-4",
+        "DIME_TEXT_PKV_CACHE_DEBUG": "0",
+
+        # ==========================================================
+        # LEVEL 2: reuse perturbations
         # ==========================================================
         "DIME_REUSE_PERTURBATIONS_ACROSS_TOKENS": "1",
     }
@@ -122,6 +161,11 @@ def _collect_reproducible_env_snapshot() -> Dict[str, str]:
     Salva TUTTE le env rilevanti al run, non solo un sottoinsieme.
     """
     keys = [
+        "DIME_TEXT_PKV_CACHE",
+        "DIME_TEXT_PKV_CACHE_VERIFY",
+        "DIME_TEXT_PKV_CACHE_MIN_COMMON_PREFIX",
+        "DIME_TEXT_PKV_CACHE_ATOL",
+        "DIME_TEXT_PKV_CACHE_RTOL",
         "DIME_REUSE_PERTURBATIONS_ACROSS_TOKENS",
         "DIME_FIXED_AUDIO_TRANSPORT_CACHE",
         "DIME_FIXED_AUDIO_TRANSPORT_MODE",
@@ -801,7 +845,7 @@ def main():
     # -------------------------
     # GPU + Runner
     # -------------------------
-    MAX_GPUS_TO_USE = 4
+    MAX_GPUS_TO_USE = 8
     MIN_FREE_GB_RUNNER = 21.0
 
     gpu_ids, _details = get_available_gpus_with_memory(min_free_memory_gb=MIN_FREE_GB_RUNNER)

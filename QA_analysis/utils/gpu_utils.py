@@ -3,10 +3,12 @@ import time
 import logging
 import subprocess
 import multiprocessing as mp
+import numpy as np
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import sys
 import warnings
+import copy
 import contextlib
 from multiprocessing import shared_memory
 
@@ -352,6 +354,731 @@ def _generate_text_response_qwen25_omni(model, processor, audio_path: Any, promp
         return str(text_out).strip()
     finally:
         _close_worker_audio_handle(shm_handle)
+
+def _move_model_inputs_to_device_dtype(model, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    import torch
+
+    out = {}
+    for k, v in inputs.items():
+        if torch.is_tensor(v):
+            vv = v.to(model.device)
+            if vv.is_floating_point():
+                vv = vv.to(model.dtype)
+            out[k] = vv
+        else:
+            out[k] = v
+    return out
+
+
+def _effective_seq_len_from_inputs(inp: Dict[str, Any]) -> int:
+    import torch
+
+    if "attention_mask" in inp and torch.is_tensor(inp["attention_mask"]):
+        return int(inp["attention_mask"][0].sum().item())
+    return int(inp["input_ids"].shape[1])
+
+
+def _longest_common_prefix_len_input_ids(per_item_inputs: List[Dict[str, Any]]) -> int:
+    if not per_item_inputs:
+        return 0
+
+    seqs = []
+    for inp in per_item_inputs:
+        eff_len = _effective_seq_len_from_inputs(inp)
+        ids = inp["input_ids"][0, :eff_len].detach().cpu().tolist()
+        seqs.append(ids)
+
+    min_len = min(len(x) for x in seqs)
+    if min_len <= 0:
+        return 0
+
+    lcp = 0
+    for i in range(min_len):
+        tok0 = seqs[0][i]
+        same = True
+        for s in seqs[1:]:
+            if s[i] != tok0:
+                same = False
+                break
+        if not same:
+            break
+        lcp += 1
+
+    return int(lcp)
+
+
+def _build_prefix_forward_inputs(full_input: Dict[str, Any], prefix_text_len: int) -> Dict[str, Any]:
+    """
+    Forward del prefisso multimodale.
+    Qui vanno inclusi anche i tensori audio/video, perché servono per costruire
+    correttamente il contesto cached del modello.
+    """
+    out: Dict[str, Any] = {
+        "input_ids": full_input["input_ids"][:, :prefix_text_len],
+    }
+
+    if "attention_mask" in full_input:
+        out["attention_mask"] = full_input["attention_mask"][:, :prefix_text_len]
+
+    for k in (
+        "input_features",
+        "feature_attention_mask",
+        "audio_feature_lengths",
+        "pixel_values",
+        "pixel_values_videos",
+        "image_grid_thw",
+        "video_grid_thw",
+        "rope_deltas",
+        "video_second_per_grid",
+    ):
+        if k in full_input:
+            out[k] = full_input[k]
+
+    return out
+
+
+def _normalize_past_key_values_for_reuse(past_key_values):
+    """
+    NON convertire a legacy format: il modello si aspetta DynamicCache.
+    Restituisce il cache così com'è.
+    """
+    return past_key_values
+
+
+def _infer_pkv_seq_len(past_key_values) -> int:
+    """
+    Ricava la lunghezza del cache. Gestisce sia DynamicCache che legacy tuple.
+    """
+    if past_key_values is None:
+        raise RuntimeError("past_key_values is None")
+
+    # DynamicCache (transformers >= 4.38, usato da Qwen2.5-Omni)
+    if hasattr(past_key_values, "get_seq_length"):
+        try:
+            return int(past_key_values.get_seq_length())
+        except Exception:
+            pass
+
+    # DynamicCache: accesso diretto key_cache
+    if hasattr(past_key_values, "key_cache"):
+        try:
+            key_cache = past_key_values.key_cache
+            if key_cache and key_cache[0] is not None:
+                return int(key_cache[0].shape[-2])
+        except Exception:
+            pass
+
+    # Legacy tuple format
+    try:
+        layer0 = past_key_values[0]
+        if isinstance(layer0, (tuple, list)):
+            return int(layer0[0].shape[-2])
+    except Exception:
+        pass
+
+    raise RuntimeError("Unable to infer KV cache sequence length from past_key_values")
+
+
+def _clone_past_key_values_for_safe_reuse(past_key_values):
+    """
+    Clona il KV cache per evitare modifiche in-place tra prompt successivi.
+
+    DynamicCache: usa copy.deepcopy (sicuro, mantiene il tipo corretto).
+    Legacy tuple: clone tensore per tensore.
+    """
+    import torch
+    import copy
+
+    if past_key_values is None:
+        return None
+
+    # DynamicCache: deepcopy mantiene la classe e i metodi (.update, ecc.)
+    if hasattr(past_key_values, "key_cache") or hasattr(past_key_values, "get_seq_length"):
+        try:
+            return copy.deepcopy(past_key_values)
+        except Exception:
+            pass
+
+    # Legacy tuple format
+    cloned = []
+    for layer in past_key_values:
+        if isinstance(layer, (tuple, list)):
+            cloned_layer = []
+            for x in layer:
+                if torch.is_tensor(x):
+                    cloned_layer.append(x.clone())
+                else:
+                    cloned_layer.append(x)
+            cloned.append(tuple(cloned_layer))
+        else:
+            cloned.append(layer)
+    return tuple(cloned)
+
+
+def _build_suffix_forward_inputs(
+    full_input: Dict[str, Any],
+    prefix_text_len: int,
+    prefix_cache_len: int,
+    past_key_values,
+) -> Optional[Dict[str, Any]]:
+    """
+    Costruisce il forward del suffix in modo coerente con il cache multimodale reale.
+    """
+    import torch
+
+    total_text_len = _effective_seq_len_from_inputs(full_input)
+    suffix_len = int(total_text_len - prefix_text_len)
+
+    if suffix_len <= 0:
+        return None
+
+    suffix_input_ids = full_input["input_ids"][:, prefix_text_len:total_text_len]
+
+    if "attention_mask" in full_input and torch.is_tensor(full_input["attention_mask"]):
+        attn_dtype = full_input["attention_mask"].dtype
+    else:
+        attn_dtype = torch.long
+
+    attention_mask = torch.ones(
+        (1, int(prefix_cache_len + suffix_len)),
+        dtype=attn_dtype,
+        device=suffix_input_ids.device,
+    )
+
+    cache_position = torch.arange(
+        int(prefix_cache_len),
+        int(prefix_cache_len + suffix_len),
+        dtype=torch.long,
+        device=suffix_input_ids.device,
+    )
+
+    out: Dict[str, Any] = {
+        "input_ids": suffix_input_ids,
+        "attention_mask": attention_mask,
+        "past_key_values": _clone_past_key_values_for_safe_reuse(past_key_values),
+        "cache_position": cache_position,
+    }
+
+    if "rope_deltas" in full_input:
+        out["rope_deltas"] = full_input["rope_deltas"]
+
+    if "video_second_per_grid" in full_input:
+        out["video_second_per_grid"] = full_input["video_second_per_grid"]
+
+    return out
+
+
+def _single_logit_from_full_prepared_inputs(
+    model,
+    full_input: Dict[str, Any],
+    target_id: int,
+) -> float:
+    import torch
+
+    inp = _move_model_inputs_to_device_dtype(model, full_input)
+    with torch.inference_mode():
+        outputs = model(**inp, use_cache=False, return_dict=True)
+
+    logits = outputs.logits[0, -1]
+    vocab_size = int(logits.shape[-1])
+
+    if not isinstance(target_id, int) or target_id < 0 or target_id >= vocab_size:
+        return float(logits.mean().item())
+
+    return float(logits[target_id].item())
+
+
+def _prepare_per_prompt_inputs_same_audio(
+    model,
+    processor,
+    audio_array: "np.ndarray",
+    target_sr: int,
+    full_prompts: List[str],
+) -> List[Dict[str, Any]]:
+    import numpy as np
+    import torch
+    from QA_analysis.utils.shared_utils import (
+        prepare_qwen25_omni_inputs,
+        _build_qwen25_audio_messages,
+    )
+
+    audio_np = np.asarray(audio_array, dtype=np.float32).reshape(-1)
+    audio_input = {"array": audio_np, "sampling_rate": int(target_sr)}
+
+    _fe_cache: dict = {}
+
+    def _audio_fingerprint(arr: np.ndarray, sr: int) -> tuple:
+        n = int(arr.shape[0]) if arr.ndim > 0 else 0
+        head = arr.ravel()[:min(64, n)].tobytes()
+        tail = arr.ravel()[-min(16, n):].tobytes() if n >= 16 else b""
+        return (n, head + tail, int(sr))
+
+    original_fe_call = processor.feature_extractor.__call__
+
+    def _cached_fe(audio, sampling_rate=None, **kwargs):
+        if isinstance(audio, (list, tuple)) and len(audio) == 1:
+            arr = np.asarray(audio[0], dtype=np.float32).reshape(-1)
+        elif isinstance(audio, np.ndarray):
+            arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+        else:
+            return original_fe_call(audio, sampling_rate=sampling_rate, **kwargs)
+
+        sr = int(sampling_rate) if sampling_rate is not None else int(target_sr)
+        key = _audio_fingerprint(arr, sr)
+
+        if key in _fe_cache:
+            return _fe_cache[key]
+
+        result = original_fe_call(audio, sampling_rate=sampling_rate, **kwargs)
+        _fe_cache[key] = result
+        return result
+
+    processor.feature_extractor.__call__ = _cached_fe
+
+    try:
+        per_item_inputs: List[Dict[str, Any]] = []
+        for fp in full_prompts:
+            messages = _build_qwen25_audio_messages(audio_input, fp)
+            _, inp = prepare_qwen25_omni_inputs(
+                processor=processor,
+                conversation=messages,
+                device=None,
+                dtype=None,
+            )
+
+            cloned = {}
+            for k, v in inp.items():
+                if torch.is_tensor(v):
+                    cloned[k] = v.detach().clone()
+                else:
+                    cloned[k] = v
+            per_item_inputs.append(cloned)
+
+        return per_item_inputs
+
+    finally:
+        processor.feature_extractor.__call__ = original_fe_call
+
+
+def _batch_dime_logit_same_audio_with_prefix_kv_inner(
+    model,
+    processor,
+    audio_array: "np.ndarray",
+    target_sr: int,
+    full_prompts: List[str],
+    target_id: int,
+) -> List[float]:
+    """
+    Reuse corretto del prefisso cached per Qwen2.5-Omni.
+
+    La chiave è:
+    - il prefisso comune si trova sui token testuali
+    - la lunghezza vera del contesto cached si legge da past_key_values
+    - il suffix va costruito con cache_position coerente col cache reale
+    """
+    import torch
+
+    if not full_prompts:
+        return []
+
+    per_item_inputs = _prepare_per_prompt_inputs_same_audio(
+        model=model,
+        processor=processor,
+        audio_array=audio_array,
+        target_sr=target_sr,
+        full_prompts=full_prompts,
+    )
+
+    if len(per_item_inputs) == 1:
+        return [_single_logit_from_full_prepared_inputs(model, per_item_inputs[0], target_id)]
+
+    lcp_text_len = _longest_common_prefix_len_input_ids(per_item_inputs)
+    min_common_prefix = int(os.environ.get("DIME_TEXT_PKV_CACHE_MIN_COMMON_PREFIX", "8"))
+
+    min_eff_text_len = min(_effective_seq_len_from_inputs(x) for x in per_item_inputs)
+
+    # deve rimanere almeno 1 token nel suffix
+    if lcp_text_len >= min_eff_text_len:
+        lcp_text_len = max(0, min_eff_text_len - 1)
+
+    if lcp_text_len < min_common_prefix:
+        return [
+            _single_logit_from_full_prepared_inputs(model, inp, target_id)
+            for inp in per_item_inputs
+        ]
+
+    try:
+        # 1) prefisso comune: una sola volta
+        prefix_inputs = _build_prefix_forward_inputs(per_item_inputs[0], lcp_text_len)
+        prefix_inputs = _move_model_inputs_to_device_dtype(model, prefix_inputs)
+
+        with torch.inference_mode():
+            prefix_out = model(**prefix_inputs, use_cache=True, return_dict=True)
+
+        past_key_values = _normalize_past_key_values_for_reuse(prefix_out.past_key_values)
+        prefix_cache_len = _infer_pkv_seq_len(past_key_values)
+
+        # se il cache è più corto del prefisso testuale, qualcosa non torna
+        if prefix_cache_len < lcp_text_len:
+            raise RuntimeError(
+                f"Invalid PKV lengths: prefix_cache_len={prefix_cache_len} < lcp_text_len={lcp_text_len}"
+            )
+
+        prefix_logits_last = prefix_out.logits[0, -1]
+        prefix_vocab_size = int(prefix_logits_last.shape[-1])
+
+        if not isinstance(target_id, int) or target_id < 0 or target_id >= prefix_vocab_size:
+            prefix_last_value = float(prefix_logits_last.mean().item())
+        else:
+            prefix_last_value = float(prefix_logits_last[target_id].item())
+
+        vals: List[float] = []
+
+        for inp in per_item_inputs:
+            suffix_inputs = _build_suffix_forward_inputs(
+                full_input=inp,
+                prefix_text_len=lcp_text_len,
+                prefix_cache_len=prefix_cache_len,
+                past_key_values=past_key_values,
+            )
+
+            if suffix_inputs is None:
+                vals.append(float(prefix_last_value))
+                continue
+
+            suffix_inputs = _move_model_inputs_to_device_dtype(model, suffix_inputs)
+
+            with torch.inference_mode():
+                out = model(**suffix_inputs, use_cache=False, return_dict=True)
+
+            logits = out.logits[0, -1]
+            vocab_size = int(logits.shape[-1])
+
+            if not isinstance(target_id, int) or target_id < 0 or target_id >= vocab_size:
+                vals.append(float(logits.mean().item()))
+            else:
+                vals.append(float(logits[target_id].item()))
+
+        # verifica exact su 2 elementi del batch
+        verify = os.environ.get("DIME_TEXT_PKV_CACHE_VERIFY", "1").lower() in ("1", "true", "yes")
+        if verify:
+            atol = float(os.environ.get("DIME_TEXT_PKV_CACHE_ATOL", "1e-5"))
+            rtol = float(os.environ.get("DIME_TEXT_PKV_CACHE_RTOL", "1e-4"))
+
+            verify_indices = [0]
+            if len(per_item_inputs) > 1:
+                verify_indices.append(len(per_item_inputs) - 1)
+
+            for idx in verify_indices:
+                baseline = _single_logit_from_full_prepared_inputs(model, per_item_inputs[idx], target_id)
+                diff = abs(float(vals[idx]) - float(baseline))
+                thr = atol + rtol * max(1.0, abs(float(vals[idx])), abs(float(baseline)))
+
+                if diff > thr:
+                    logger.warning(
+                        "[DIME PKV CACHE] verify failed -> fallback full path | "
+                        f"idx={idx} diff={diff:.6e} thr={thr:.6e} "
+                        f"lcp_text_len={lcp_text_len} prefix_cache_len={prefix_cache_len}"
+                    )
+                    return [
+                        _single_logit_from_full_prepared_inputs(model, inp, target_id)
+                        for inp in per_item_inputs
+                    ]
+
+        return vals
+
+    except Exception as e:
+        logger.warning(
+            "[DIME PKV CACHE] fallback full path after error: "
+            f"{e} | num_prompts={len(full_prompts)} | lcp_text_len={lcp_text_len}"
+        )
+        return [
+            _single_logit_from_full_prepared_inputs(model, inp, target_id)
+            for inp in per_item_inputs
+        ]
+
+# ==========================================================
+# Batch logit helpers — Bottleneck 2 fix (v2: manual tensor batching)
+# ==========================================================
+
+def _batch_dime_logit_same_audio_inner(
+    model,
+    processor,
+    audio_array: "np.ndarray",
+    target_sr: int,
+    full_prompts: List[str],
+    target_id: int,
+) -> List[float]:
+    """
+    Batch forward pass: stesso audio, N prompt diversi.
+
+    v2 — mel spectrogram cached: processor.feature_extractor viene patchato
+    temporaneamente per restituire il risultato cached per le chiamate 2..B-1
+    con lo stesso audio. Riduce il preprocessing da O(B) a O(1) mel spec.
+    """
+    import torch
+    import numpy as np
+    from QA_analysis.utils.shared_utils import (
+        prepare_qwen25_omni_inputs,
+        _build_qwen25_audio_messages,
+    )
+
+    B = len(full_prompts)
+    if B == 0:
+        return []
+
+    audio_np = np.asarray(audio_array, dtype=np.float32).reshape(-1)
+    audio_input = {"array": audio_np, "sampling_rate": int(target_sr)}
+
+    # ── Feature-extractor cache ──────────────────────────────────────────
+    # Stesso audio per tutti i B item → mel spec identico → computato 1 sola volta.
+    # Fingerprint O(80 elementi): lunghezza + primi 64 + ultimi 16 campioni.
+    # Robusto a np.asarray() che crea nuovi oggetti ma stesso contenuto.
+    _fe_cache: dict = {}
+
+    def _audio_fingerprint(arr: np.ndarray, sr: int) -> tuple:
+        n = int(arr.shape[0]) if arr.ndim > 0 else 0
+        head = arr.ravel()[:min(64, n)].tobytes()
+        tail = arr.ravel()[-min(16, n):].tobytes() if n >= 16 else b""
+        return (n, head + tail, int(sr))
+
+    original_fe_call = processor.feature_extractor.__call__
+
+    def _cached_fe(audio, sampling_rate=None, **kwargs):
+        # Normalizza in np.ndarray per calcolare il fingerprint
+        if isinstance(audio, (list, tuple)) and len(audio) == 1:
+            arr = np.asarray(audio[0], dtype=np.float32).reshape(-1)
+        elif isinstance(audio, np.ndarray):
+            arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+        else:
+            return original_fe_call(audio, sampling_rate=sampling_rate, **kwargs)
+
+        sr = int(sampling_rate) if sampling_rate is not None else int(target_sr)
+        key = _audio_fingerprint(arr, sr)
+
+        if key in _fe_cache:
+            return _fe_cache[key]  # cache hit: mel spec gratis
+
+        result = original_fe_call(audio, sampling_rate=sampling_rate, **kwargs)
+        _fe_cache[key] = result
+        return result
+
+    processor.feature_extractor.__call__ = _cached_fe
+    # ────────────────────────────────────────────────────────────────────
+
+    try:
+        per_item_inputs = []
+        for fp in full_prompts:
+            messages = _build_qwen25_audio_messages(audio_input, fp)
+            _, inp = prepare_qwen25_omni_inputs(
+                processor=processor,
+                conversation=messages,
+                device=None,
+                dtype=None,
+            )
+            per_item_inputs.append({k: v.detach().clone() for k, v in inp.items()})
+    finally:
+        # Ripristina sempre il feature extractor originale
+        processor.feature_extractor.__call__ = original_fe_call
+
+    if B == 1:
+        inp0 = {
+            k: (v.to(model.device).to(model.dtype) if v.is_floating_point() else v.to(model.device))
+            for k, v in per_item_inputs[0].items()
+        }
+        with torch.inference_mode():
+            outputs = model(**inp0, use_cache=False)
+        return [float(outputs.logits[0, -1, target_id].item())]
+
+    # ── Manual tensor batching ────────────────────────────────────────────
+    pad_id = processor.tokenizer.pad_token_id if processor.tokenizer.pad_token_id is not None else 0
+    all_keys = list(per_item_inputs[0].keys())
+    batched = {}
+
+    for key in all_keys:
+        tensors = [inp[key] for inp in per_item_inputs]
+        shapes = [t.shape for t in tensors]
+
+        if key == "input_ids":
+            max_len = max(t.shape[1] for t in tensors)
+            padded = []
+            for t in tensors:
+                gap = max_len - t.shape[1]
+                if gap > 0:
+                    padded.append(torch.cat(
+                        [torch.full((1, gap), pad_id, dtype=t.dtype), t], dim=1
+                    ))
+                else:
+                    padded.append(t)
+            batched[key] = torch.cat(padded, dim=0)
+
+        elif key == "attention_mask":
+            max_len = max(t.shape[1] for t in tensors)
+            padded = []
+            for t in tensors:
+                gap = max_len - t.shape[1]
+                if gap > 0:
+                    padded.append(torch.cat(
+                        [torch.zeros((1, gap), dtype=t.dtype), t], dim=1
+                    ))
+                else:
+                    padded.append(t)
+            batched[key] = torch.cat(padded, dim=0)
+
+        elif all(s == shapes[0] for s in shapes):
+            batched[key] = torch.cat(tensors, dim=0)
+
+        else:
+            max_last = max(t.shape[-1] for t in tensors)
+            padded = []
+            for t in tensors:
+                gap = max_last - t.shape[-1]
+                if gap > 0:
+                    pad_shape = list(t.shape)
+                    pad_shape[-1] = gap
+                    padded.append(torch.cat(
+                        [t, torch.zeros(pad_shape, dtype=t.dtype)], dim=-1
+                    ))
+                else:
+                    padded.append(t)
+            try:
+                batched[key] = torch.cat(padded, dim=0)
+            except RuntimeError:
+                batched[key] = tensors[0].expand(B, *tensors[0].shape[1:]).clone()
+
+    batched = {
+        k: (v.to(model.device).to(model.dtype) if v.is_floating_point() else v.to(model.device))
+        for k, v in batched.items()
+    }
+
+    with torch.inference_mode():
+        outputs = model(**batched, use_cache=False)
+
+    logits_last = outputs.logits[:, -1, :]
+    vals = [float(logits_last[i, target_id].item()) for i in range(B)]
+
+    del outputs, batched
+    return vals
+
+
+def _batch_dime_logit_same_prompt_inner(
+    model,
+    processor,
+    audio_arrays: List["np.ndarray"],
+    target_sr: int,
+    full_prompt: str,
+    target_id: int,
+) -> List[float]:
+    """
+    Batch forward pass: N audio diversi, stesso prompt.
+
+    Stesso meccanismo di _batch_dime_logit_same_audio_inner:
+    prepare_qwen25_omni_inputs per item, poi batching manuale dei tensori.
+    """
+    import torch
+    import numpy as np
+    from QA_analysis.utils.shared_utils import (
+        prepare_qwen25_omni_inputs,
+        _build_qwen25_audio_messages,
+    )
+
+    B = len(audio_arrays)
+    if B == 0:
+        return []
+
+    per_item_inputs = []
+    for arr in audio_arrays:
+        audio_input = {
+            "array": np.asarray(arr, dtype=np.float32).reshape(-1),
+            "sampling_rate": int(target_sr),
+        }
+        messages = _build_qwen25_audio_messages(audio_input, full_prompt)
+        _, inp = prepare_qwen25_omni_inputs(
+            processor=processor,
+            conversation=messages,
+            device=None,
+            dtype=None,
+        )
+        per_item_inputs.append({k: v.detach().clone() for k, v in inp.items()})
+
+    if B == 1:
+        inp0 = {
+            k: (v.to(model.device).to(model.dtype) if v.is_floating_point() else v.to(model.device))
+            for k, v in per_item_inputs[0].items()
+        }
+        with torch.inference_mode():
+            outputs = model(**inp0, use_cache=False)
+        return [float(outputs.logits[0, -1, target_id].item())]
+
+    pad_id = processor.tokenizer.pad_token_id if processor.tokenizer.pad_token_id is not None else 0
+    all_keys = list(per_item_inputs[0].keys())
+    batched = {}
+
+    for key in all_keys:
+        tensors = [inp[key] for inp in per_item_inputs]
+        shapes = [t.shape for t in tensors]
+
+        if key == "input_ids":
+            max_len = max(t.shape[1] for t in tensors)
+            padded = []
+            for t in tensors:
+                gap = max_len - t.shape[1]
+                if gap > 0:
+                    padded.append(torch.cat(
+                        [torch.full((1, gap), pad_id, dtype=t.dtype), t], dim=1
+                    ))
+                else:
+                    padded.append(t)
+            batched[key] = torch.cat(padded, dim=0)
+
+        elif key == "attention_mask":
+            max_len = max(t.shape[1] for t in tensors)
+            padded = []
+            for t in tensors:
+                gap = max_len - t.shape[1]
+                if gap > 0:
+                    padded.append(torch.cat(
+                        [torch.zeros((1, gap), dtype=t.dtype), t], dim=1
+                    ))
+                else:
+                    padded.append(t)
+            batched[key] = torch.cat(padded, dim=0)
+
+        elif all(s == shapes[0] for s in shapes):
+            batched[key] = torch.cat(tensors, dim=0)
+
+        else:
+            max_last = max(t.shape[-1] for t in tensors)
+            padded = []
+            for t in tensors:
+                gap = max_last - t.shape[-1]
+                if gap > 0:
+                    pad_shape = list(t.shape)
+                    pad_shape[-1] = gap
+                    padded.append(torch.cat(
+                        [t, torch.zeros(pad_shape, dtype=t.dtype)], dim=-1
+                    ))
+                else:
+                    padded.append(t)
+            try:
+                batched[key] = torch.cat(padded, dim=0)
+            except RuntimeError:
+                batched[key] = tensors[0].expand(B, *tensors[0].shape[1:]).clone()
+
+    batched = {
+        k: (v.to(model.device).to(model.dtype) if v.is_floating_point() else v.to(model.device))
+        for k, v in batched.items()
+    }
+
+    with torch.inference_mode():
+        outputs = model(**batched, use_cache=False)
+
+    logits_last = outputs.logits[:, -1, :]
+    vals = [float(logits_last[i, target_id].item()) for i in range(B)]
+
+    del outputs, batched
+    return vals
+
 # ==========================================================
 # Worker
 # ==========================================================
@@ -386,6 +1113,7 @@ def _worker_loop(
             torch_dtype=dtype,
             device_map=None,
             low_cpu_mem_usage=True,
+            attn_implementation="flash_attention_2",
         ).eval().to("cuda:0")
 
         logger.info(f"[worker gpu={gpu_id}] Modello caricato correttamente.")
@@ -522,27 +1250,71 @@ def _worker_loop(
                 audio_paths = task.payload["audio_paths"]
                 prompts = task.payload["prompts"]
                 batch_id = int(task.payload["batch_id"])
-
+                tok = processor.tokenizer
+                target_id = int(caption_ids[token_index])
+                prefix_ids = caption_ids[:token_index]
+                prefix_text = ""
+                if prefix_ids:
+                    prefix_text = tok.convert_tokens_to_string(
+                        tok.convert_ids_to_tokens(prefix_ids)
+                    )
+                # full_prompts: uguale per TUTTI gli audio perturbati del batch
+                full_prompts = [
+                    (p + " " + prefix_text).strip() if prefix_text else p
+                    for p in prompts
+                ]
+                target_sr = processor.feature_extractor.sampling_rate
+                inner_bs = int(os.environ.get("DIME_WORKER_INNER_BATCH_SIZE", "4"))
+                use_pkv_cache = os.environ.get("DIME_TEXT_PKV_CACHE", "1").lower() in ("1", "true", "yes")
                 rows = []
                 for ap_raw in audio_paths:
                     ap, ap_handle = _materialize_worker_audio_input(ap_raw)
                     try:
-                        row = []
-                        for p in prompts:
-                            with torch.inference_mode():
-                                v = dime_token_value(
+                        if isinstance(ap, dict) and "array" in ap:
+                            audio_arr = np.asarray(ap["array"], dtype=np.float32).reshape(-1)
+                            arr_sr = int(ap.get("sampling_rate", target_sr))
+                            if arr_sr != target_sr:
+                                import librosa as _librosa
+                                audio_arr = _librosa.resample(
+                                    audio_arr, orig_sr=arr_sr, target_sr=target_sr
+                                )
+                                audio_arr = np.asarray(audio_arr, dtype=np.float32)
+                        else:
+                            import librosa as _librosa
+                            audio_arr, _ = _librosa.load(str(ap), sr=target_sr, mono=True)
+                            audio_arr = np.asarray(audio_arr, dtype=np.float32)
+                        if use_pkv_cache:
+                            # PKV cache: passa TUTTI i prompts in una sola chiamata.
+                            # Il prefisso comune (audio tokens + scaffolding, ~1547 token)
+                            # viene computato UNA volta; i suffix (~50-100 token ciascuno)
+                            # vengono processati in serial ma sono 10-20× più corti.
+                            # NON usare inner_bs qui: il costo è dominato dal prefix forward,
+                            # non dal numero di suffix.
+                            row = _batch_dime_logit_same_audio_with_prefix_kv_inner(
+                                model=model,
+                                processor=processor,
+                                audio_array=audio_arr,
+                                target_sr=target_sr,
+                                full_prompts=full_prompts,
+                                target_id=target_id,
+                            )
+                        else:
+                            # Fallback: batching manuale con mel spec cache
+                            row = []
+                            for b0 in range(0, len(full_prompts), inner_bs):
+                                batch_fps = full_prompts[b0:b0 + inner_bs]
+                                vals = _batch_dime_logit_same_audio_inner(
                                     model=model,
                                     processor=processor,
-                                    audio_path=ap,
-                                    prompt=p,
-                                    caption_ids=caption_ids,
-                                    token_index=token_index,
+                                    audio_array=audio_arr,
+                                    target_sr=target_sr,
+                                    full_prompts=batch_fps,
+                                    target_id=target_id,
                                 )
-                            row.append(float(v))
-                        rows.append(row)
+                                row.extend(vals)
+                        rows.append([float(x) for x in row])
                     finally:
                         _close_worker_audio_handle(ap_handle)
-
                 result_q.put(("dime_row_values_batch", {
                     "req_id": req_id,
                     "batch_id": batch_id,
@@ -556,28 +1328,69 @@ def _worker_loop(
                 audio_paths = task.payload["audio_paths"]
                 prompts = task.payload["prompts"]
                 batch_id = int(task.payload["batch_id"])
-
-                cols = []
-                for p in prompts:
-                    col = []
+                tok = processor.tokenizer
+                target_id = int(caption_ids[token_index])
+                prefix_ids = caption_ids[:token_index]
+                prefix_text = ""
+                if prefix_ids:
+                    prefix_text = tok.convert_tokens_to_string(
+                        tok.convert_ids_to_tokens(prefix_ids)
+                    )
+                full_prompts = [
+                    (p + " " + prefix_text).strip() if prefix_text else p
+                    for p in prompts
+                ]
+                target_sr = processor.feature_extractor.sampling_rate
+                use_pkv_cache = os.environ.get("DIME_TEXT_PKV_CACHE", "1").lower() in ("1", "true", "yes")
+                audio_arrays: List[np.ndarray] = []
+                audio_handles = []
+                try:
                     for ap_raw in audio_paths:
                         ap, ap_handle = _materialize_worker_audio_input(ap_raw)
-                        try:
-                            with torch.inference_mode():
-                                v = dime_token_value(
-                                    model=model,
-                                    processor=processor,
-                                    audio_path=ap,
-                                    prompt=p,
-                                    caption_ids=caption_ids,
-                                    token_index=token_index,
-                                )
-                        finally:
-                            _close_worker_audio_handle(ap_handle)
+                        audio_handles.append(ap_handle)
+                        if isinstance(ap, dict) and "array" in ap:
+                            arr = np.asarray(ap["array"], dtype=np.float32).reshape(-1)
+                            arr_sr = int(ap.get("sampling_rate", target_sr))
+                            if arr_sr != target_sr:
+                                import librosa as _librosa
+                                arr = _librosa.resample(arr, orig_sr=arr_sr, target_sr=target_sr)
+                                arr = np.asarray(arr, dtype=np.float32)
+                        else:
+                            import librosa as _librosa
+                            arr, _ = _librosa.load(str(ap), sr=target_sr, mono=True)
+                            arr = np.asarray(arr, dtype=np.float32)
+                        audio_arrays.append(arr)
+                    rows_by_audio: List[List[float]] = []
+                    for audio_arr in audio_arrays:
+                        if use_pkv_cache:
+                            row_vals = _batch_dime_logit_same_audio_with_prefix_kv_inner(
+                                model=model,
+                                processor=processor,
+                                audio_array=audio_arr,
+                                target_sr=target_sr,
+                                full_prompts=full_prompts,
+                                target_id=target_id,
+                            )
+                        else:
+                            row_vals = _batch_dime_logit_same_audio_inner(
+                                model=model,
+                                processor=processor,
+                                audio_array=audio_arr,
+                                target_sr=target_sr,
+                                full_prompts=full_prompts,
+                                target_id=target_id,
+                            )
+                        rows_by_audio.append([float(x) for x in row_vals])
+                    num_prompts = len(full_prompts)
+                    num_audios = len(audio_arrays)
+                    cols: List[List[float]] = []
+                    for j in range(num_prompts):
+                        col_j = [float(rows_by_audio[i][j]) for i in range(num_audios)]
+                        cols.append(col_j)
 
-                        col.append(float(v))
-                    cols.append(col)
-
+                finally:
+                    for h in audio_handles:
+                        _close_worker_audio_handle(h)
                 result_q.put(("dime_col_values_batch", {
                     "req_id": req_id,
                     "batch_id": batch_id,
@@ -600,23 +1413,43 @@ def _worker_loop(
                         dtype=getattr(model, "dtype", None),
                         use_audio_in_video=False,
                     )
-                    with torch.inference_mode():
-                        outputs = model.generate(
-                            **inputs,
-                            max_new_tokens=max(1, len(target_ids) + 2),
-                            return_dict_in_generate=True,
-                            output_logits=True,
-                            use_cache=False,
-                        )
-                    step_logits = torch.stack([x[0] for x in outputs.logits], dim=0)
-                    T = min(step_logits.shape[0], len(target_ids))
+                    T = len(target_ids)
                     vals = []
-                    for t in range(T):
-                        tid = int(target_ids[t])
-                        if 0 <= tid < step_logits.shape[1]:
-                            vals.append(float(step_logits[t, tid].item()))
+                    if T == 1:
+                        # ── Fast path: single target token → 1 forward pass ──────────
+                        # Nessuna generazione autoregressiva: solo il logit al last token.
+                        # 3-5× più veloce di model.generate() per risposte mono-token
+                        # (A/B/C/D in HumMusQA).
+                        with torch.inference_mode():
+                            outputs = model(**inputs, use_cache=False, return_dict=True)
+                        logits_last = outputs.logits[0, -1]
+                        tid = int(target_ids[0])
+                        vocab_size = int(logits_last.shape[-1])
+                        if 0 <= tid < vocab_size:
+                            vals.append(float(logits_last[tid].item()))
                         else:
-                            vals.append(float(step_logits[t].mean().item()))
+                            vals.append(float(logits_last.mean().item()))
+
+                    else:
+                        # ── Multi-token path: usa generate() come prima ───────────────
+                        # Necessario per risposte con più token (raro in HumMusQA).
+                        with torch.inference_mode():
+                            outputs = model.generate(
+                                **inputs,
+                                max_new_tokens=max(1, T + 2),
+                                return_dict_in_generate=True,
+                                output_logits=True,
+                                use_cache=False,
+                            )
+                        step_logits = torch.stack([x[0] for x in outputs.logits], dim=0)
+                        T_actual = min(step_logits.shape[0], T)
+                        for t in range(T_actual):
+                            tid = int(target_ids[t])
+                            if 0 <= tid < step_logits.shape[1]:
+                                vals.append(float(step_logits[t, tid].item()))
+                            else:
+                                vals.append(float(step_logits[t].mean().item()))
+
                 finally:
                     _close_worker_audio_handle(audio_handle)
                 result_q.put(("mmshap_logits", {
@@ -1056,7 +1889,7 @@ class ParallelTokenRunner:
 # ==========================================================
 def try_create_parallel_runner(
     model_path: str,
-    max_gpus: int = 4,
+    max_gpus: int = 8,
     min_free_memory_gb: float = 24.0,
     allowed_gpu_ids: Optional[List[int]] = None,
     gpu_ids_physical: Optional[List[int]] = None,

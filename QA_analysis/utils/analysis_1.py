@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Any
 import librosa
 import numpy as np
 import shap
+from multiprocessing import shared_memory
+import uuid
 
 import shap.utils.transformers as shap_tf_utils
 
@@ -374,10 +376,10 @@ def compute_mmshap_qa_sample(
         q_start, q_end = extract_only_question_text_span(prompt)
 
         # --------------------------------------------------
-        # 1) Costruzione di tutte le perturbazioni del batch
+        # 1) Costruzione perturbazioni — shared memory invece di tempfile
         # --------------------------------------------------
         request_items: List[Dict[str, Any]] = []
-        created_tmp_paths: List[str] = []
+        shm_handles_to_cleanup = []  # (shm_obj, shm_descriptor)
 
         try:
             for i in range(batch_size):
@@ -393,34 +395,47 @@ def compute_mmshap_qa_sample(
 
                 masked_audio = y.copy()
                 to_mask = torch.where(masked_audio_token_ids[i] == 0)[0].detach().cpu().tolist()
-
                 for k in to_mask:
                     start = int(k) * audio_segment_size
                     end = min((int(k) + 1) * audio_segment_size, len(masked_audio))
                     masked_audio[start:end] = 0.0
 
-                tmp_audio = _tmp_wav_path(prefix="mmshap_qa_")
-                sf.write(tmp_audio, masked_audio, sr)
+                masked_audio_f32 = np.asarray(masked_audio, dtype=np.float32).reshape(-1)
 
-                created_tmp_paths.append(tmp_audio)
+                # Trasporto via shared memory: evita sf.write + file I/O
+                shm_name = f"mmshap_{uuid.uuid4().hex}"
+                shm = shared_memory.SharedMemory(create=True, size=masked_audio_f32.nbytes, name=shm_name)
+                shm_arr = np.ndarray(masked_audio_f32.shape, dtype=masked_audio_f32.dtype, buffer=shm.buf)
+                shm_arr[:] = masked_audio_f32[:]
+                shm.close()  # chiude handle locale, il blocco resta vivo
+
+                shm_descriptor = {
+                    "kind": "shared_memory_audio",
+                    "shm_name": shm_name,
+                    "shape": tuple(int(x) for x in masked_audio_f32.shape),
+                    "dtype": str(masked_audio_f32.dtype),
+                    "sampling_rate": int(sr),
+                    "nbytes": int(masked_audio_f32.nbytes),
+                }
+                shm_handles_to_cleanup.append(shm_name)
+
                 request_items.append({
-                    "audio_path": tmp_audio,
+                    "audio_path": shm_descriptor,
                     "prompt": new_prompt,
                     "target_ids": list(target_ids),
                 })
 
             # --------------------------------------------------
-            # 2) Invio parallelo ai worker/GPU
+            # 2) Invio parallelo
             # --------------------------------------------------
             parallel_window = _get_mmshap_parallel_window(runner)
-
             batch_outputs = runner.get_mmshap_logits_batch(
                 items=request_items,
                 window=parallel_window,
             )
 
             # --------------------------------------------------
-            # 3) Ricostruzione output in ordine
+            # 3) Risultati
             # --------------------------------------------------
             for i, vals in enumerate(batch_outputs):
                 row = np.zeros((len(target_ids),), dtype=float)
@@ -430,10 +445,13 @@ def compute_mmshap_qa_sample(
                 result[i] = row
 
         finally:
-            for tmp_audio in created_tmp_paths:
+            # Cleanup shared memory
+            for shm_name in shm_handles_to_cleanup:
                 try:
-                    os.remove(tmp_audio)
-                except OSError:
+                    shm = shared_memory.SharedMemory(name=shm_name)
+                    shm.close()
+                    shm.unlink()
+                except Exception:
                     pass
 
         return result

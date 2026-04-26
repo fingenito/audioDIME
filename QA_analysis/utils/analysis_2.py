@@ -93,6 +93,11 @@ def get_dime_module_config_snapshot() -> Dict[str, Any]:
     alla config attesa del main.
     """
     return {
+        "DIME_TEXT_PKV_CACHE": os.environ.get("DIME_TEXT_PKV_CACHE", "0"),
+        "DIME_TEXT_PKV_CACHE_VERIFY": os.environ.get("DIME_TEXT_PKV_CACHE_VERIFY", "1"),
+        "DIME_TEXT_PKV_CACHE_MIN_COMMON_PREFIX": os.environ.get("DIME_TEXT_PKV_CACHE_MIN_COMMON_PREFIX", "8"),
+        "DIME_TEXT_PKV_CACHE_ATOL": os.environ.get("DIME_TEXT_PKV_CACHE_ATOL", "1e-5"),
+        "DIME_TEXT_PKV_CACHE_RTOL": os.environ.get("DIME_TEXT_PKV_CACHE_RTOL", "1e-4"),
         "DIME_REUSE_PERTURBATIONS_ACROSS_TOKENS": bool(_REUSE_PERTURBATIONS_ACROSS_TOKENS),
         "DIME_STEP4A_AUDIO_IO_MODE": str(_DIME_STEP4A_AUDIO_IO_MODE),
         "DIME_STEP4A_AUDIO_EQ_ATOL": float(_DIME_STEP4A_AUDIO_EQ_ATOL),
@@ -578,9 +583,6 @@ def _fit_audiolime_surrogate_from_binary_data(
         float(intercept),
     )
 
-# ==========================
-# Audio masking (for Step4A)
-# ==========================
 # ==========================
 # Audio masking (for Step4A)
 # ==========================
@@ -2468,6 +2470,11 @@ def analyze_dime(
         "explanations": explanations,
         "wordlevel": wordlevel,
         "config": {
+            "DIME_TEXT_PKV_CACHE": os.environ.get("DIME_TEXT_PKV_CACHE", "0"),
+            "DIME_TEXT_PKV_CACHE_VERIFY": os.environ.get("DIME_TEXT_PKV_CACHE_VERIFY", "1"),
+            "DIME_TEXT_PKV_CACHE_MIN_COMMON_PREFIX": os.environ.get("DIME_TEXT_PKV_CACHE_MIN_COMMON_PREFIX", "8"),
+            "DIME_TEXT_PKV_CACHE_ATOL": os.environ.get("DIME_TEXT_PKV_CACHE_ATOL", "1e-5"),
+            "DIME_TEXT_PKV_CACHE_RTOL": os.environ.get("DIME_TEXT_PKV_CACHE_RTOL", "1e-4"),
             "DIME_FIXED_AUDIO_TRANSPORT_CACHE": os.environ.get("DIME_FIXED_AUDIO_TRANSPORT_CACHE", "1"),
             "DIME_FIXED_AUDIO_TRANSPORT_MODE": os.environ.get("DIME_FIXED_AUDIO_TRANSPORT_MODE", "shared_memory"),
             "DIME_REUSE_PERTURBATIONS_ACROSS_TOKENS": bool(_REUSE_PERTURBATIONS_ACROSS_TOKENS),

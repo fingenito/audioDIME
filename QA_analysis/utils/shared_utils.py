@@ -99,19 +99,6 @@ def _conversation_has_inline_audio(conversation) -> bool:
                 return True
     return False
 
-def _extract_audio_payloads_from_conversation(conversation):
-    """
-    Manteniamo questa funzione solo per backward compatibility interna.
-    NON usarla nel ramo inline del processor.
-    """
-    audios = []
-    for msg in conversation or []:
-        for item in msg.get("content", []) or []:
-            if item.get("type") != "audio":
-                continue
-            audio_obj = item.get("audio", None)
-            audios.append(audio_obj)
-    return audios
 
 def _build_qwen25_audio_messages(audio_path: Any, prompt: str):
     """
@@ -138,96 +125,7 @@ def _build_qwen25_audio_messages(audio_path: Any, prompt: str):
         }
     ]
 
-def _trim_generated_ids_at_first_im_end(gen_ids_1d: torch.Tensor, processor) -> torch.Tensor:
-    """
-    Mantiene solo i token generati dell'assistente fino al primo <|im_end|>.
-    """
-    ids = gen_ids_1d.detach().clone()
-    tok = processor.tokenizer
 
-    im_end_id = getattr(tok, "eos_token_id", None)
-    if im_end_id is None:
-        try:
-            im_end_id = tok.convert_tokens_to_ids("<|im_end|>")
-        except Exception:
-            im_end_id = 151645
-
-    cut = len(ids)
-    for i in range(len(ids)):
-        if int(ids[i].item()) == int(im_end_id):
-            cut = i
-            break
-
-    return ids[:cut]
-
-def generate_shared_hummusqa_baseline(
-    model,
-    processor,
-    audio_path: Any,
-    prompt: str,
-    max_new_tokens: int = 16,
-    verbose: bool = True,
-) -> Dict[str, Any]:
-    """
-    Genera UNA sola baseline condivisa tra DIME e MM-SHAP.
-
-    Restituisce:
-    - baseline_answer: risposta testuale del modello
-    - input_ids: input tokenizzati Qwen2.5-Omni
-    - output_ids: token generati della baseline
-    - prompt/audio_path: per validazione coerenza downstream
-
-    Nota:
-    - salva input_ids/output_ids su CPU per evitare retention inutile su GPU
-    - NON modifica la metodologia di nessuna analisi; serve solo a condividere
-      il punto di partenza tra analisi diverse.
-    """
-    if verbose:
-        print("Generazione baseline condivisa...")
-
-    messages = _build_qwen25_audio_messages(audio_path, prompt)
-
-    _text, inputs = prepare_qwen25_omni_inputs(
-        processor=processor,
-        conversation=messages,
-        device=model.device,
-        dtype=getattr(model, "dtype", None),
-        use_audio_in_video=False,
-    )
-
-    with torch.inference_mode():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            return_dict_in_generate=True,
-            output_scores=False,
-            output_logits=False,
-            use_cache=False,
-        )
-
-    sequences = outputs.sequences
-    input_len = int(inputs["input_ids"].shape[1])
-
-    gen_ids = sequences[0, input_len:]
-    gen_ids = _trim_generated_ids_at_first_im_end(gen_ids, processor)
-
-    baseline_answer = processor.tokenizer.decode(
-        gen_ids.detach().cpu().tolist(),
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    ).strip()
-
-    if verbose:
-        print(f"Baseline condivisa: {baseline_answer}")
-
-    return {
-        "audio_path": str(audio_path),
-        "prompt": str(prompt),
-        "baseline_answer": str(baseline_answer),
-        "input_ids": inputs["input_ids"].detach().cpu().clone(),
-        "output_ids": gen_ids.unsqueeze(0).detach().cpu().clone(),
-        "max_new_tokens": int(max_new_tokens),
-    }
 
 _QWEN_CHAT_TEMPLATE_CACHE: "OrderedDict[tuple, str]" = OrderedDict()
 
@@ -452,44 +350,6 @@ def tokenize_caption_for_mmshap(text, processor, return_ids: bool = False):
         return ids, clean
     return clean
 
-def get_token_logprob_autoregressive_id(
-    model,
-    processor,
-    audio_path: Any,
-    prompt: str,
-    prefix_ids: list,
-    target_id: int,
-) -> float:
-
-    tok = processor.tokenizer
-
-    if prefix_ids:
-        prefix_tokens = tok.convert_ids_to_tokens(prefix_ids)
-        prefix_text = tok.convert_tokens_to_string(prefix_tokens)
-        full_prompt = prompt + " " + prefix_text if prefix_text else prompt
-    else:
-        full_prompt = prompt
-
-    messages = _build_qwen25_audio_messages(audio_path, full_prompt)
-    _text, inputs = prepare_qwen25_omni_inputs(
-        processor=processor,
-        conversation=messages,
-        device=model.device,
-        dtype=getattr(model, "dtype", None),
-        use_audio_in_video=False,
-    )
-
-    with torch.inference_mode():
-        outputs = model(**inputs, use_cache=False)
-
-    logits = outputs.logits[0, -1]
-    log_probs = torch.log_softmax(logits, dim=-1)
-
-    vocab_size = int(log_probs.size(-1))
-    if not isinstance(target_id, int) or target_id < 0 or target_id >= vocab_size:
-        return float(log_probs.mean().item())
-
-    return float(log_probs[target_id].item())
 
 def get_token_logit_autoregressive_id(
     model,
@@ -780,98 +640,6 @@ def _find_subsequence(haystack: List[int], needle: List[int]) -> int:
             return i
     return -1
 
-def extract_hummusqa_question_only_tokens_from_input_ids_qwen25(
-    processor,
-    input_ids,
-    question: str,
-):
-    """
-    Estrae SOLO i token della domanda dentro l'input Qwen2.5-Omni,
-    senza includere:
-      - options
-      - scaffolding istruzionale
-      - token speciali/audio/chat
-
-    Strategia:
-      1) trova lo span utente tra <|audio_eos|> e <|im_end|>
-      2) tokenizza la sola stringa 'question'
-      3) cerca quella sottosequenza nello span utente
-      4) restituisce i token della domanda e il loro intervallo globale
-
-    Returns:
-        question_ids_t: 1D tensor dei token della sola domanda
-        n_question_tokens: int
-        interval: (start_idx, end_idx) nello input_ids completo
-                  con convenzione [start_idx:end_idx]
-    """
-    import torch
-
-    if input_ids.ndim != 2 or input_ids.shape[0] != 1:
-        raise ValueError(f"Expected input_ids shape [1, T], got {tuple(input_ids.shape)}")
-
-    tok = processor.tokenizer
-    ids = input_ids[0]
-    ids_list = ids.detach().cpu().tolist()
-
-    audio_eos_id = getattr(tok, "audio_eos_token_id", None)
-    if audio_eos_id is None:
-        try:
-            audio_eos_id = tok.convert_tokens_to_ids("<|audio_eos|>")
-        except Exception:
-            audio_eos_id = 151648
-
-    im_end_id = getattr(tok, "eos_token_id", None)
-    if im_end_id is None:
-        try:
-            im_end_id = tok.convert_tokens_to_ids("<|im_end|>")
-        except Exception:
-            im_end_id = 151645
-
-    try:
-        audio_eos_pos = ids_list.index(int(audio_eos_id))
-    except ValueError:
-        raise RuntimeError("audio_eos token not found in input_ids")
-
-    im_end_pos = None
-    for i in range(audio_eos_pos + 1, len(ids_list)):
-        if int(ids_list[i]) == int(im_end_id):
-            im_end_pos = i
-            break
-
-    if im_end_pos is None:
-        raise RuntimeError("user im_end token not found after audio_eos")
-
-    user_start = audio_eos_pos + 1
-    user_end = im_end_pos
-
-    if user_end <= user_start:
-        raise RuntimeError(f"Empty user text span detected: start={user_start}, end={user_end}")
-
-    user_span_ids = ids_list[user_start:user_end]
-
-    question = str(question).strip()
-    if not question:
-        raise RuntimeError("Question string is empty")
-
-    question_ids = tok.encode(question, add_special_tokens=False)
-    if not question_ids:
-        raise RuntimeError("Question tokenization returned an empty sequence")
-
-    local_start = _find_subsequence(user_span_ids, question_ids)
-    if local_start == -1:
-        raise RuntimeError(
-            "Could not locate question token subsequence inside user text span. "
-            "This likely means the prompt formatting or tokenization changed."
-        )
-
-    local_end = local_start + len(question_ids)
-
-    global_start = user_start + local_start
-    global_end = user_start + local_end
-
-    question_ids_t = ids[global_start:global_end].detach().clone()
-
-    return question_ids_t, int(question_ids_t.numel()), (int(global_start), int(global_end))
 
 def load_hummusqa_entries_parquet(dataset_root: str):
     from datasets import load_dataset, Audio
