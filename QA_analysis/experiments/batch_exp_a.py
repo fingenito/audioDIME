@@ -16,9 +16,9 @@ Output layout:
             exp_a_results.csv       ← copia CSV per ispezione rapida
 
 Utilizzo:
-    python batch_exp_a.py
-    python batch_exp_a.py --resume          # riprende dal checkpoint
-    python batch_exp_a.py --only-aggregate  # solo aggregazione dei JSON esistenti
+    python -m QA_analysis.experiments.batch_exp_a
+    python -m QA_analysis.experiments.batch_exp_a --resume <BATCH_DIR>
+    python -m QA_analysis.experiments.batch_exp_a --resume <BATCH_DIR> --only-aggregate
 """
 
 import os
@@ -40,8 +40,116 @@ import numpy as np
 import librosa
 import soundfile as sf
 
+
 # =============================================================================
-# 0) ENV — deve stare prima di qualsiasi import del progetto
+# 0a) Soppressione warning verbose
+# =============================================================================
+
+import warnings as _warnings
+_warnings.filterwarnings("ignore", category=DeprecationWarning)
+_warnings.filterwarnings("ignore", category=FutureWarning)
+_warnings.filterwarnings("ignore", category=UserWarning)
+
+# Silenzia TensorFlow/absl/grpc PRIMA di qualsiasi import del progetto
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("ABSL_LOGGING_VERBOSITY", "3")
+
+# IMPORTANTE: PYTHONWARNINGS viene letto dai sub-processi spawn.
+os.environ.setdefault(
+    "PYTHONWARNINGS",
+    "ignore::DeprecationWarning,ignore::FutureWarning,ignore::UserWarning"
+)
+
+# Pre-importa nel processo padre i moduli deprecati con i filtri attivi.
+# Quando dopo audioread.rawread tenterà di reimportarli, sono già in
+# sys.modules e non emetteranno più warning.
+with _warnings.catch_warnings():
+    _warnings.simplefilter("ignore")
+    for _mod in ("aifc", "audioop", "sunau"):
+        try:
+            __import__(_mod)
+        except Exception:
+            pass
+
+# Silenzia absl
+try:
+    import absl.logging
+    absl.logging.set_verbosity(absl.logging.ERROR)
+    absl.logging.set_stderrthreshold("error")
+except Exception:
+    pass
+
+
+# =============================================================================
+# 0b) Filtro su stderr — droppa righe rumorose dai worker spawn
+# =============================================================================
+
+_NOISE_PATTERNS = (
+    "aifc",
+    "audioop",
+    "sunau",
+    "is deprecated and slated for removal",
+    "DeprecationWarning",
+    "FutureWarning",
+    "oneDNN custom operations are on",
+    "oneDNN",
+    "absl::InitializeLog",
+    "All log messages before",
+    "I0000 00:",
+    "port.cc:",
+    "Could not load symbol",
+    "TF_ENABLE_ONEDNN",
+)
+
+class _StderrFilter:
+    """
+    Wrapper attorno a stderr che droppa righe contenenti pattern rumorosi.
+    Tracebacks ed errori veri ('Error:', 'Exception:', 'Traceback') passano sempre.
+    """
+    def __init__(self, real):
+        self._real = real
+        self._buf = ""
+
+    def write(self, s):
+        if not s:
+            return
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._emit_line(line + "\n")
+
+    def _emit_line(self, line):
+        stripped = line.strip()
+        if not stripped:
+            self._real.write(line)
+            return
+        # Errori veri passano sempre
+        if any(k in stripped for k in ("Traceback", "Error:", "Exception:", "CRITICAL", "FAIL")):
+            self._real.write(line)
+            return
+        # Filtra rumore noto
+        if any(p in stripped for p in _NOISE_PATTERNS):
+            return
+        self._real.write(line)
+
+    def flush(self):
+        if self._buf:
+            self._emit_line(self._buf)
+            self._buf = ""
+        self._real.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+# Attiva il filtro
+sys.stderr = _StderrFilter(sys.stderr)
+
+
+# =============================================================================
+# 0c) ENV — deve stare prima di qualsiasi import del progetto
 # =============================================================================
 
 def _apply_env() -> None:
@@ -93,6 +201,8 @@ def _apply_env() -> None:
         "DIME_TEXT_PKV_CACHE_RTOL": "1e-4",
         "DIME_TEXT_PKV_CACHE_DEBUG": "0",
         "DIME_REUSE_PERTURBATIONS_ACROSS_TOKENS": "1",
+        "TORCH_HOME": "/nas/home/fingenito/Thesis_project/QA_analysis/data/torch_cache",
+        "TORCH_HUB": "/nas/home/fingenito/Thesis_project/QA_analysis/data/torch_cache/hub",
     }
     for k, v in env_cfg.items():
         os.environ[k] = str(v)
@@ -118,33 +228,31 @@ from QA_analysis.utils.shared_utils import (
 # =============================================================================
 
 HUMMUSQA_ROOT = "/nas/home/fingenito/HumMusQA/data"
-EXPERIMENT_RESULTS_ROOT = "/nas/home/fingenito/Thesis_project/QA_analysis/Results_QA"
+EXPERIMENT_RESULTS_ROOT = "/nas/home/fingenito/Thesis_project/QA_analysis/Results_QA/experiments"
 MODEL_PATH = "/nas/home/fingenito/Models/Qwen2.5-Omni-7B"
 
 MAX_GPUS_TO_USE = 8
 MIN_FREE_GB_RUNNER = 21.0
 
+# =============================================================================
+# TEST MODE — modifica reversibile
+# =============================================================================
+TEST_FIRST_N_VALID_SAMPLES: Optional[int] = 5
+
+
 # Macrofamiglie per l'analisi aggregata.
-# ⚠ VERIFICA: controlla che i valori corrispondano esattamente ai
-#   valori del campo 'category' nel parquet HumMusQA.
 MACRO_FAMILY_MAP: Dict[str, str] = {
-    "Instrumentation": "percettiva",
-    "Sound Texture": "percettiva",
-    "Metre": "percettiva",
-    "Rhythm": "percettiva",
-    "Tempo": "percettiva",
-    "Dynamics": "percettiva",
-    "Harmony": "analitica",
-    "Melody": "analitica",
-    "Form": "analitica",
-    "Performance": "analitica",
-    "Genre": "knowledge",
-    "Style": "knowledge",
-    "Historical": "knowledge",
-    "Cultural": "knowledge",
-    "Lyrics": "knowledge",
-    "Emotion": "knowledge",
-    "Mood": "knowledge",
+    "Instrumentation":   "percettiva",
+    "Sound Texture":     "percettiva",
+    "Metre and Rhythm":  "percettiva",
+    "Musical Texture":   "percettiva",
+    "Harmony":           "analitica",
+    "Melody":            "analitica",
+    "Structure":         "analitica",
+    "Performance":       "analitica",
+    "Genre and Style":   "knowledge",
+    "Historical":        "knowledge",
+    "Mood and Expression": "knowledge",
 }
 
 # =============================================================================
@@ -168,6 +276,12 @@ logger.propagate = False
 for _noisy in ["transformers", "huggingface_hub", "datasets", "urllib3",
                "qwen_omni_utils", "QwenOmni"]:
     _lg = logging.getLogger(_noisy)
+    _lg.setLevel(logging.ERROR)
+    _lg.propagate = False
+
+for _extra in ["tensorflow", "jax", "grpc", "absl", "torch", "matplotlib",
+               "torch.distributed", "demucs", "demucs.api", "h5py"]:
+    _lg = logging.getLogger(_extra)
     _lg.setLevel(logging.ERROR)
     _lg.propagate = False
 
@@ -257,10 +371,8 @@ def _sha1_array(arr: np.ndarray) -> str:
 # 5) HumMusQA helpers
 # =============================================================================
 
-# Nomi di campo tentati per category/difficulty.
-# ⚠ Se il tuo parquet usa nomi diversi, aggiungili qui.
-_CATEGORY_FIELDS = ["category", "Category", "music_category", "task_category", "type", "task"]
-_DIFFICULTY_FIELDS = ["difficulty", "Difficulty", "level", "Level", "skill_level"]
+_CATEGORY_FIELDS = ["main_category", "category", "Category"]
+_DIFFICULTY_FIELDS = ["difficulty", "Difficulty"]
 
 
 def _get_field(entry: dict, candidates: List[str], default: str = "") -> str:
@@ -274,12 +386,11 @@ def _get_field(entry: dict, candidates: List[str], default: str = "") -> str:
 def extract_hummusqa_meta(entry: dict, idx: int) -> Dict[str, Any]:
     """
     Estrae i metadati di un entry HumMusQA, inclusi category e difficulty.
-    Usa fallback multipli per robustezza rispetto a variazioni nei nomi di campo.
     """
     sample_id = str(
+        entry.get("identifier") or
         entry.get("question_id") or
         entry.get("id") or
-        entry.get("sample_id") or
         f"sample_{idx}"
     )
 
@@ -295,7 +406,6 @@ def extract_hummusqa_meta(entry: dict, idx: int) -> Dict[str, Any]:
     category = _get_field(entry, _CATEGORY_FIELDS, default="unknown")
     difficulty = _get_field(entry, _DIFFICULTY_FIELDS, default="unknown")
 
-    # Macrofamiglia
     macro = "unknown"
     for keyword, family in MACRO_FAMILY_MAP.items():
         if keyword.lower() in category.lower():
@@ -338,10 +448,7 @@ def _infer_audio_ext(entry: dict) -> str:
 
 
 def materialize_audio(entry: dict, cache_dir: str, idx: int) -> str:
-    """
-    Restituisce un path WAV canonico per il sample.
-    Uguale alla logica in main.py (_materialize_hummusqa_audio).
-    """
+    """Restituisce un path WAV canonico per il sample."""
     os.makedirs(cache_dir, exist_ok=True)
     audio_field = entry.get("audio", None)
 
@@ -398,7 +505,61 @@ def _answer_to_letter(correct_answer_str: str, options: List[str]) -> str:
     for i, opt in enumerate(options):
         if str(opt).strip().lower() == correct_answer_str.strip().lower():
             return chr(65 + i)
-    return "A"  # fallback: in HumMusQA la risposta corretta è sempre options[0]
+    return "A"
+
+
+def _normalize_segment_boundaries(raw_boundaries: Any) -> List[Dict[str, Optional[float]]]:
+    """
+    DIME salva 'segment_boundaries_sec' come LISTA DI DICT della forma:
+        [{"segment_index": 0, "segment_start_sec": 0.0, "segment_end_sec": 7.5}, ...]
+
+    Per robustezza accettiamo anche formati alternativi (lista di float, lista di
+    coppie [start, end]) e li convertiamo nello stesso formato dict.
+    """
+    if not raw_boundaries or not isinstance(raw_boundaries, (list, tuple)):
+        return []
+
+    out: List[Dict[str, Optional[float]]] = []
+    for i, item in enumerate(raw_boundaries):
+        if isinstance(item, dict):
+            try:
+                seg_idx = int(item.get("segment_index", i))
+            except (TypeError, ValueError):
+                seg_idx = i
+            try:
+                s_start = float(item["segment_start_sec"]) if item.get("segment_start_sec") is not None else None
+            except (TypeError, ValueError):
+                s_start = None
+            try:
+                s_end = float(item["segment_end_sec"]) if item.get("segment_end_sec") is not None else None
+            except (TypeError, ValueError):
+                s_end = None
+            out.append({
+                "segment_index": seg_idx,
+                "segment_start_sec": s_start,
+                "segment_end_sec": s_end,
+            })
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            try:
+                out.append({
+                    "segment_index": i,
+                    "segment_start_sec": float(item[0]),
+                    "segment_end_sec": float(item[1]),
+                })
+            except (TypeError, ValueError):
+                continue
+        else:
+            try:
+                v = float(item)
+                prev_end = out[-1]["segment_end_sec"] if out and out[-1]["segment_end_sec"] is not None else 0.0
+                out.append({
+                    "segment_index": i,
+                    "segment_start_sec": prev_end,
+                    "segment_end_sec": v,
+                })
+            except (TypeError, ValueError):
+                continue
+    return out
 
 
 def extract_exp_a_fields(
@@ -409,23 +570,16 @@ def extract_exp_a_fields(
     """
     Estrae tutti i campi necessari per Exp A da un run DIME + MM-SHAP.
 
-    Chiavi reali verificate su run_53:
-      mmshap.json:
-        "A-SHAP", "T-SHAP", "baseline_answer_raw", "correct_answer", "options"
-      dime_results_step4.json:
-        "audio_global_aggregations": {
-            "uc1_stem": [4],  "mi1_stem": [4]   ← per stem, aggregato su time
-            "uc1_time": [8],  "mi1_time": [8]   ← per segment, aggregato su stems
-            "uc1_global_stem_segment": [4][8],  "mi1_global_stem_segment": [4][8]
-            "stem_names": [4]
-            "segment_boundaries_sec": [9]
-        }
-        "wordlevel": { "prompt": {
-            "words": [...],
-            "uc2_global_word": [...],
-            "mi2_global_word": [...]
-        }}
-        "explanations": { "0": { "base_ucmi": float, "token": str } }
+    Chiavi DIME (audio_global_aggregations):
+        uc1_stem [4], mi1_stem [4]               - aggregato su time
+        uc1_time [N_seg], mi1_time [N_seg]       - aggregato su stems
+        uc1_global_stem_segment [4][N_seg]
+        mi1_global_stem_segment [4][N_seg]
+        stem_names [4]
+        segment_boundaries_sec  → LISTA DI DICT (segment_index, segment_start_sec, segment_end_sec)
+
+    Chiavi MM-SHAP:
+        A-SHAP, T-SHAP, baseline_answer_raw, correct_answer, options
     """
     # ---- MM-SHAP ----
     a_shap = float(mmshap_json.get("A-SHAP", 0.0))
@@ -442,17 +596,22 @@ def extract_exp_a_fields(
     mi1_stem: List[float] = [float(x) for x in agg.get("mi1_stem", [0.0] * 4)]
     uc1_time: List[float] = [float(x) for x in agg.get("uc1_time", [0.0] * 8)]
     mi1_time: List[float] = [float(x) for x in agg.get("mi1_time", [0.0] * 8)]
-    stem_names: List[str] = agg.get("stem_names", ["drums", "bass", "other", "vocals"])
-    seg_boundaries: List[float] = [float(x) for x in agg.get("segment_boundaries_sec", [])]
+    stem_names: List[str] = list(agg.get("stem_names", ["drums", "bass", "other", "vocals"]))
 
-    # matrice 4×8 stems × segments
+    # FIX: segment_boundaries_sec è una LISTA DI DICT, non di float
+    seg_boundaries_raw = agg.get("segment_boundaries_sec", [])
+    seg_boundaries_dicts = _normalize_segment_boundaries(seg_boundaries_raw)
+    seg_starts: List[Optional[float]] = [d["segment_start_sec"] for d in seg_boundaries_dicts]
+    seg_ends:   List[Optional[float]] = [d["segment_end_sec"]   for d in seg_boundaries_dicts]
+
+    # matrici 4×N_seg stems × segments
     uc1_matrix = [[float(v) for v in row] for row in agg.get("uc1_global_stem_segment", [])]
     mi1_matrix = [[float(v) for v in row] for row in agg.get("mi1_global_stem_segment", [])]
 
     # ---- DIME text ----
     wl = dime_json.get("wordlevel", {})
     prompt_wl = wl.get("prompt", {})
-    question_words: List[str] = prompt_wl.get("words", [])
+    question_words: List[str] = list(prompt_wl.get("words", []))
     uc2_words: List[float] = [float(x) for x in prompt_wl.get("uc2_global_word", [])]
     mi2_words: List[float] = [float(x) for x in prompt_wl.get("mi2_global_word", [])]
 
@@ -462,17 +621,17 @@ def extract_exp_a_fields(
     if "0" in explanations:
         base_ucmi = explanations["0"].get("base_ucmi", None)
     if base_ucmi is not None:
-        base_ucmi = float(base_ucmi)
+        try:
+            base_ucmi = float(base_ucmi)
+        except (TypeError, ValueError):
+            base_ucmi = None
 
-    # ---- Scalari aggregati (norma L1 sul valore assoluto) ----
-    # Usiamo L1 perché LIME con ridge restituisce valori positivi e negativi.
-    # Per "quanto conta" una modalità, la norma L1 è più stabile della somma algebrica.
+    # ---- Scalari aggregati ----
     uc_audio_l1 = float(np.sum(np.abs(uc1_stem)))
     mi_audio_l1 = float(np.sum(np.abs(mi1_stem)))
     uc_text_l1 = float(np.sum(np.abs(uc2_words)))
     mi_text_l1 = float(np.sum(np.abs(mi2_words)))
 
-    # Somma algebrica (può essere negativa, utile per analisi di segno)
     uc_audio_sum = float(np.sum(uc1_stem))
     mi_audio_sum = float(np.sum(mi1_stem))
     uc_text_sum = float(np.sum(uc2_words))
@@ -516,7 +675,11 @@ def extract_exp_a_fields(
         # DIME vettori per segmento temporale
         "uc1_time": uc1_time,
         "mi1_time": mi1_time,
-        "segment_boundaries_sec": seg_boundaries,
+
+        # Boundaries: dict-list originale + due vettori paralleli
+        "segment_boundaries_sec": seg_boundaries_dicts,
+        "segment_starts_sec": seg_starts,
+        "segment_ends_sec": seg_ends,
 
         # DIME matrici stems × segments
         "uc1_stem_x_seg": uc1_matrix,
@@ -532,24 +695,17 @@ def extract_exp_a_fields(
     }
 
 # =============================================================================
-# 7) Cleanup artifacts (no plot, no L_tables)
+# 7) Cleanup artifacts
 # =============================================================================
 
 def cleanup_run_artifacts(run_dir: str) -> None:
-    """
-    Rimuove tutti i file non essenziali da una directory di run singolo:
-    - file .png (plot)
-    - file .npy (L_tables)
-    - directory L_tables/
-    Mantiene solo i .json.
-    """
+    """Rimuove .png, .npy e dir L_tables. Mantiene i .json."""
     for ext in ("*.png", "*.npy"):
         for f in glob.glob(os.path.join(run_dir, "**", ext), recursive=True):
             try:
                 os.remove(f)
             except Exception:
                 pass
-
     ltables = os.path.join(run_dir, "L_tables")
     if os.path.isdir(ltables):
         try:
@@ -577,15 +733,10 @@ def _save_progress(batch_dir: str, progress: Dict[str, Any]) -> None:
 # =============================================================================
 
 def aggregate_exp_a_results(batch_dir: str) -> str:
-    """
-    Legge tutti i {sample_id}_exp_a.json in per_sample/ e li
-    aggrega in un parquet e un CSV nella cartella aggregated/.
-    Restituisce il path del parquet.
-    """
     try:
         import pandas as pd
     except ImportError:
-        raise ImportError("pandas richiesto per l'aggregazione. pip install pandas")
+        raise ImportError("pandas richiesto. pip install pandas")
 
     per_sample_dir = os.path.join(batch_dir, "per_sample")
     records = []
@@ -597,20 +748,16 @@ def aggregate_exp_a_results(batch_dir: str) -> str:
         logger.warning("Nessun file _exp_a.json trovato — aggregazione vuota.")
         return ""
 
-    # Flatten: i campi lista (uc1_stem, mi1_stem, ecc.) vengono espansi
-    # come colonne separate per facilitare l'analisi con pandas.
     flat_records = []
     for r in records:
         row = {k: v for k, v in r.items() if not isinstance(v, (list, dict))}
 
-        # Espandi uc1_stem / mi1_stem per stem
         for stem_idx, stem in enumerate(r.get("stem_names", ["drums", "bass", "other", "vocals"])):
             uc = r.get("uc1_stem", [])
             mi = r.get("mi1_stem", [])
             row[f"uc_stem_{stem}"] = float(uc[stem_idx]) if stem_idx < len(uc) else float("nan")
             row[f"mi_stem_{stem}"] = float(mi[stem_idx]) if stem_idx < len(mi) else float("nan")
 
-        # Espandi uc1_time / mi1_time per segmento
         for seg_idx in range(8):
             uc_t = r.get("uc1_time", [])
             mi_t = r.get("mi1_time", [])
@@ -632,21 +779,97 @@ def aggregate_exp_a_results(batch_dir: str) -> str:
     return parquet_path
 
 # =============================================================================
-# 10) Main batch loop
+# 10) Estrazione Exp D
+# =============================================================================
+def extract_exp_d_fields(
+        dime_json: dict,
+        meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Estrae i campi per l'Esperimento D dal DIME JSON.
+    NON richiede nessuna modifica a analysis_2.py.
+
+    La grounding_matrix parola×segmento è approssimata come prodotto esterno:
+        G[w, s] ≈ mi2_global_word[w] × mi1_time[s]
+    Questo è una proxy dei marginali separati, non la vera interazione
+    cross-modale. Va dichiarato come limitazione metodologica.
+    """
+    wl = dime_json.get("wordlevel", {})
+    prompt_wl = wl.get("prompt", {})
+    agg = dime_json.get("audio_global_aggregations", {})
+
+    # --- Parole della domanda e loro importanza ---
+    prompt_words: List[str] = list(prompt_wl.get("words", []))
+    mi2_global_word: List[float] = [float(x) for x in prompt_wl.get("mi2_global_word", [])]
+    uc2_global_word: List[float] = [float(x) for x in prompt_wl.get("uc2_global_word", [])]
+
+    # --- Segmenti audio ---
+    mi1_time: List[float] = [float(x) for x in agg.get("mi1_time", [])]
+    uc1_time: List[float] = [float(x) for x in agg.get("uc1_time", [])]
+    seg_boundaries_raw = agg.get("segment_boundaries_sec", [])
+    seg_boundaries = _normalize_segment_boundaries(seg_boundaries_raw)
+
+    # --- Matrice stems × segmenti ---
+    mi1_stem_x_seg: List[List[float]] = [
+        [float(v) for v in row]
+        for row in agg.get("mi1_global_stem_segment", [])
+    ]
+    uc1_stem_x_seg: List[List[float]] = [
+        [float(v) for v in row]
+        for row in agg.get("uc1_global_stem_segment", [])
+    ]
+    stem_names: List[str] = list(agg.get("stem_names", ["drums", "bass", "other", "vocals"]))
+
+    # --- Grounding matrix approssimata: prodotto esterno mi2_word × mi1_time ---
+    # G[w, s] ≈ mi2_global_word[w] × mi1_time[s]
+    # LIMITAZIONE: non è la vera cross-modale; è la proxy dei marginali separati.
+    grounding_matrix_approx: List[List[float]] = []
+    if mi2_global_word and mi1_time:
+        arr_w = np.array(mi2_global_word, dtype=float)
+        arr_s = np.array(mi1_time, dtype=float)
+        G = np.outer(arr_w, arr_s)
+        grounding_matrix_approx = G.tolist()
+
+    # --- Feature metadata per segmenti (boundaries in sec) ---
+    audio_axis_info = dime_json.get("audio_axis_info", {})
+
+    return {
+        "sample_id": meta["sample_id"],
+        "category": meta["category"],
+        "difficulty": meta["difficulty"],
+        "macro_family": meta["macro_family"],
+
+        # Testo: parole della domanda + importanza
+        "prompt_words": prompt_words,
+        "mi2_global_word": mi2_global_word,
+        "uc2_global_word": uc2_global_word,
+
+        # Audio: importanza per segmento temporale
+        "mi1_time": mi1_time,
+        "uc1_time": uc1_time,
+        "segment_boundaries_sec": seg_boundaries,
+
+        # Audio: matrice stems × segmenti
+        "stem_names": stem_names,
+        "mi1_stem_x_seg": mi1_stem_x_seg,
+        "uc1_stem_x_seg": uc1_stem_x_seg,
+
+        # Grounding matrix approssimata (prodotto esterno marginali)
+        "grounding_matrix_approx": grounding_matrix_approx,
+        "grounding_matrix_method": "outer_product_marginali",  # dichiarazione limitazione
+
+        # Metadata audio axis
+        "audio_axis_info": audio_axis_info,
+    }
+
+# =============================================================================
+# 11) Main batch loop
 # =============================================================================
 
 def run_batch_exp_a(
     resume_dir: Optional[str] = None,
     only_aggregate: bool = False,
 ) -> str:
-    """
-    Esegue il batch completo per Exp A.
-    Se resume_dir è fornito, riprende il batch esistente.
-    Se only_aggregate è True, salta il batch e aggrega solo i JSON esistenti.
-    Restituisce il path della batch_dir.
-    """
-
-    # ----- Directory setup -----
     exp_root = os.path.join(EXPERIMENT_RESULTS_ROOT, "exp_A")
     _ensure_dir(exp_root)
 
@@ -660,37 +883,33 @@ def run_batch_exp_a(
     per_sample_dir = _ensure_dir(os.path.join(batch_dir, "per_sample"))
     audio_cache_dir = _ensure_dir(os.path.join(batch_dir, "_audio_cache"))
 
-    # ----- Solo aggregazione -----
     if only_aggregate:
         logger.info("Modalità only-aggregate: salto inferenza.")
         aggregate_exp_a_results(batch_dir)
         return batch_dir
 
-    # ----- Carica entries HumMusQA -----
     logger.info(f"Caricamento HumMusQA da: {HUMMUSQA_ROOT}")
     entries, parquet_files = load_hummusqa_entries_parquet(HUMMUSQA_ROOT)
     valid_entries = [(i, e) for i, e in enumerate(entries) if _entry_has_valid_mcqa(e)]
     logger.info(f"Entry valide: {len(valid_entries)} / {len(entries)}")
 
-    # Verifica colonne category/difficulty (early warning)
+    if TEST_FIRST_N_VALID_SAMPLES is not None:
+        valid_entries = valid_entries[:int(TEST_FIRST_N_VALID_SAMPLES)]
+        logger.info(f"[TEST MODE] Uso solo i primi {len(valid_entries)} sample validi.")
+
     if valid_entries:
         _, sample_entry = valid_entries[0]
         cat_found = any(k in sample_entry for k in _CATEGORY_FIELDS)
         diff_found = any(k in sample_entry for k in _DIFFICULTY_FIELDS)
         if not cat_found:
             logger.warning(
-                f"⚠ Nessun campo category trovato nell'entry. "
-                f"Campi disponibili: {list(sample_entry.keys())}. "
-                f"Aggiorna _CATEGORY_FIELDS nel codice."
+                f"⚠ Nessun campo category trovato. Campi: {list(sample_entry.keys())}"
             )
         if not diff_found:
             logger.warning(
-                f"⚠ Nessun campo difficulty trovato nell'entry. "
-                f"Campi disponibili: {list(sample_entry.keys())}. "
-                f"Aggiorna _DIFFICULTY_FIELDS nel codice."
+                f"⚠ Nessun campo difficulty trovato. Campi: {list(sample_entry.keys())}"
             )
 
-    # ----- Modello e runner -----
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(f"Model path non trovato: {MODEL_PATH}")
 
@@ -710,7 +929,6 @@ def run_batch_exp_a(
 
     processor = Qwen2_5OmniProcessor.from_pretrained(MODEL_PATH)
 
-    # ----- Salva run_info -----
     _atomic_json_dump(
         {
             "batch_dir": batch_dir,
@@ -718,6 +936,7 @@ def run_batch_exp_a(
             "hummusqa_root": HUMMUSQA_ROOT,
             "parquet_files": [str(p) for p in parquet_files],
             "n_valid_entries": len(valid_entries),
+            "test_first_n_valid_samples": TEST_FIRST_N_VALID_SAMPLES,
             "gpu_ids": gpu_ids,
             "model_path": MODEL_PATH,
             "dime_module_config": get_dime_module_config_snapshot(),
@@ -725,7 +944,6 @@ def run_batch_exp_a(
         os.path.join(batch_dir, "run_info.json"),
     )
 
-    # ----- Pre-materializza tutti gli audio (con cache) -----
     logger.info("Pre-materializzazione audio (con cache disco)...")
     all_audio_paths: List[str] = []
     all_prompts: List[str] = []
@@ -746,19 +964,15 @@ def run_batch_exp_a(
         all_prompts.append(prompt)
         all_metas.append(meta)
 
-    # ----- Checkpoint -----
     progress = _load_progress(batch_dir)
     completed_ids = set(progress.get("completed", []))
-    failed_ids = set(progress.get("failed", []))
 
     total = len(valid_entries)
     logger.info(
         f"Stato checkpoint: {len(completed_ids)} completati, "
-        f"{len(failed_ids)} falliti, "
-        f"{total - len(completed_ids) - len(failed_ids)} da fare."
+        f"{total - len(completed_ids)} da fare."
     )
 
-    # ----- Loop principale -----
     try:
         for batch_pos, (orig_idx, entry) in enumerate(valid_entries):
             meta = all_metas[batch_pos]
@@ -772,8 +986,9 @@ def run_batch_exp_a(
 
             if not audio_path or not os.path.exists(audio_path):
                 logger.warning(f"[{batch_pos+1}/{total}] SKIP (audio mancante): {sample_id}")
-                failed_ids.add(sample_id)
-                progress["failed"] = list(failed_ids)
+                if not isinstance(progress.get("failed"), list):
+                    progress["failed"] = []
+                progress["failed"].append({"sample_id": sample_id, "error": "audio_missing"})
                 _save_progress(batch_dir, progress)
                 continue
 
@@ -785,19 +1000,14 @@ def run_batch_exp_a(
 
             t0 = time.time()
             try:
-                # Directory temporanea per questo sample (verrà ripulita)
-                tmp_run_dir = _ensure_dir(
-                    os.path.join(batch_dir, "_tmp_run", sample_id)
-                )
+                tmp_run_dir = _ensure_dir(os.path.join(batch_dir, "_tmp_run", sample_id))
                 dime_dir = _ensure_dir(os.path.join(tmp_run_dir, "dime"))
                 mmshap_dir = _ensure_dir(os.path.join(tmp_run_dir, "mmshap"))
 
-                # Background pairs: tutti gli altri audio del pool
                 bg_audio = [p for i, p in enumerate(all_audio_paths)
                             if i != batch_pos and p and os.path.exists(p)]
                 bg_prompts = [p for i, p in enumerate(all_prompts)
                               if i != batch_pos and p]
-                # Limita a NUM_EXPECTATION_SAMPLES come nel run singolo
                 n_bg = int(os.environ.get("DIME_NUM_EXPECTATION_SAMPLES", "16"))
                 rng = np.random.RandomState(0)
                 if len(bg_audio) > n_bg - 1:
@@ -806,10 +1016,7 @@ def run_batch_exp_a(
                     bg_prompts = [bg_prompts[i] for i in sel]
 
                 # ---- Baseline condivisa ----
-                caption = runner.generate_caption(
-                    audio_path=audio_path,
-                    prompt=prompt,
-                )
+                caption = runner.generate_caption(audio_path=audio_path, prompt=prompt)
                 shared_baseline = {
                     "baseline_answer": caption,
                     "prompt": prompt,
@@ -852,27 +1059,39 @@ def run_batch_exp_a(
                     num_features=int(os.environ.get("DIME_LIME_NUM_FEATURES_AUDIO", "16")),
                 )
 
-                # ---- Rimuovi plot e L_tables ----
-                cleanup_run_artifacts(dime_dir)
-                cleanup_run_artifacts(mmshap_dir)
+                # ---- Path JSON ----
+                # DIME espone json_path nel return; MM-SHAP no, lo costruiamo da convenzione
+                dime_json_path = dime_results.get("json_path", "") if isinstance(dime_results, dict) else ""
+                mmshap_json_path = mmshap_results.get("json_path", "") if isinstance(mmshap_results, dict) else ""
+                if not mmshap_json_path:
+                    mmshap_json_path = os.path.join(mmshap_dir, f"{sample_id}_mmshap.json")
 
-                # ---- Leggi i JSON salvati dalle analisi ----
-                dime_json_path = dime_results.get("json_path", "")
-                mmshap_json_path = mmshap_results.get("json_path", "")
+                if not dime_json_path or not os.path.exists(dime_json_path):
+                    raise FileNotFoundError(
+                        f"DIME JSON non trovato. Path atteso: '{dime_json_path}'. "
+                        f"Contenuto di {dime_dir}: {os.listdir(dime_dir) if os.path.isdir(dime_dir) else 'DIR INESISTENTE'}"
+                    )
+                if not os.path.exists(mmshap_json_path):
+                    raise FileNotFoundError(
+                        f"MM-SHAP JSON non trovato. Path atteso: '{mmshap_json_path}'. "
+                        f"Contenuto di {mmshap_dir}: {os.listdir(mmshap_dir) if os.path.isdir(mmshap_dir) else 'DIR INESISTENTE'}"
+                    )
 
                 with open(dime_json_path, "r") as f:
                     dime_json = json.load(f)
                 with open(mmshap_json_path, "r") as f:
                     mmshap_json = json.load(f)
 
-                # ---- Estrai campi Exp A ----
                 exp_a_row = extract_exp_a_fields(dime_json, mmshap_json, meta)
+                exp_d_row = extract_exp_d_fields(dime_json, meta)
+                out_d_path = os.path.join(per_sample_dir, f"{sample_id}_exp_d.json")
+                _atomic_json_dump(exp_d_row, out_d_path)
 
-                # ---- Salva per-sample JSON ----
                 out_path = os.path.join(per_sample_dir, f"{sample_id}_exp_a.json")
                 _atomic_json_dump(exp_a_row, out_path)
 
-                # ---- Cleanup tmp ----
+                cleanup_run_artifacts(dime_dir)
+                cleanup_run_artifacts(mmshap_dir)
                 shutil.rmtree(tmp_run_dir, ignore_errors=True)
 
                 elapsed = time.time() - t0
@@ -883,7 +1102,7 @@ def run_batch_exp_a(
                 )
 
                 completed_ids.add(sample_id)
-                progress["completed"] = list(completed_ids)
+                progress["completed"] = sorted(completed_ids)
                 _save_progress(batch_dir, progress)
 
                 gc.collect()
@@ -891,17 +1110,15 @@ def run_batch_exp_a(
             except Exception as e:
                 elapsed = time.time() - t0
                 tb = traceback.format_exc()
-                logger.error(
-                    f"  ✗ {sample_id} FALLITO dopo {elapsed:.0f}s:\n{tb}"
-                )
-                failed_ids.add(sample_id)
+                logger.error(f"  ✗ {sample_id} FALLITO dopo {elapsed:.0f}s:\n{tb}")
+                if not isinstance(progress.get("failed"), list):
+                    progress["failed"] = []
                 progress["failed"].append({
                     "sample_id": sample_id,
                     "error": str(e),
                     "traceback": tb[:2000],
                 })
                 _save_progress(batch_dir, progress)
-                # Cleanup tmp anche in caso di errore
                 try:
                     shutil.rmtree(
                         os.path.join(batch_dir, "_tmp_run", sample_id),
@@ -917,13 +1134,11 @@ def run_batch_exp_a(
             runner.stop()
         except Exception:
             pass
-        # Cleanup cartella tmp generale
         try:
             shutil.rmtree(os.path.join(batch_dir, "_tmp_run"), ignore_errors=True)
         except Exception:
             pass
 
-    # ----- Aggregazione finale -----
     logger.info("Batch completato. Avvio aggregazione...")
     aggregate_exp_a_results(batch_dir)
 
@@ -931,7 +1146,6 @@ def run_batch_exp_a(
         f"\n{'='*60}\n"
         f"BATCH EXP A COMPLETATO\n"
         f"  completati : {len(completed_ids)}\n"
-        f"  falliti    : {len(failed_ids)}\n"
         f"  batch dir  : {batch_dir}\n"
         f"{'='*60}"
     )
@@ -944,18 +1158,8 @@ def run_batch_exp_a(
 
 def main():
     parser = argparse.ArgumentParser(description="Batch runner Esperimento A")
-    parser.add_argument(
-        "--resume",
-        type=str,
-        default=None,
-        metavar="BATCH_DIR",
-        help="Riprendi un batch esistente dalla sua directory.",
-    )
-    parser.add_argument(
-        "--only-aggregate",
-        action="store_true",
-        help="Salta il batch, aggrega solo i JSON già esistenti nella batch dir.",
-    )
+    parser.add_argument("--resume", type=str, default=None, metavar="BATCH_DIR")
+    parser.add_argument("--only-aggregate", action="store_true")
     args = parser.parse_args()
 
     if args.only_aggregate and not args.resume:
@@ -968,6 +1172,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import warnings
-    warnings.filterwarnings("ignore")
     main()

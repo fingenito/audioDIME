@@ -14,6 +14,24 @@ from transformers import (
     Qwen2_5OmniProcessor,
 )
 
+# SOSTITUISCI con:
+_CATEGORY_FIELDS = ["main_category", "category", "Category"]
+_DIFFICULTY_FIELDS = ["difficulty", "Difficulty"]
+
+MACRO_FAMILY_MAP: Dict[str, str] = {
+    "Instrumentation":   "percettiva",
+    "Sound Texture":     "percettiva",
+    "Metre and Rhythm":  "percettiva",
+    "Musical Texture":   "percettiva",
+    "Harmony":           "analitica",
+    "Melody":            "analitica",
+    "Structure":         "analitica",
+    "Performance":       "analitica",
+    "Genre and Style":   "knowledge",
+    "Historical":        "knowledge",
+    "Mood and Expression": "knowledge",
+}
+
 # =============================================================================
 # 0) ENV: TUTTI i settaggi DEVONO essere fissati qui, prima degli import progetto
 # =============================================================================
@@ -535,6 +553,39 @@ def _entry_has_valid_mcqa(entry: dict) -> bool:
     opts = _extract_options(entry)
     return bool(q) and len(opts) == 4 and all(isinstance(x, str) for x in opts) and all(x != "" for x in opts)
 
+def _extract_entry_category(entry: dict) -> str:
+    """
+    Estrae il campo 'category' da un entry HumMusQA.
+    Prova multipli nomi di campo per robustezza.
+    Restituisce 'unknown' se nessun campo trovato.
+    """
+    for key in _CATEGORY_FIELDS:
+        val = entry.get(key, None)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return "unknown"
+
+
+def _extract_entry_difficulty(entry: dict) -> str:
+    """
+    Estrae il campo 'difficulty' da un entry HumMusQA.
+    Prova multipli nomi di campo per robustezza.
+    Restituisce 'unknown' se nessun campo trovato.
+    """
+    for key in _DIFFICULTY_FIELDS:
+        val = entry.get(key, None)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return "unknown"
+
+
+def _extract_entry_macro_family(category: str) -> str:
+    """Mappa category → macrofamiglia."""
+    for keyword, fam in MACRO_FAMILY_MAP.items():
+        if keyword.lower() in category.lower():
+            return fam
+    return "unknown"
+
 def _infer_audio_extension_from_entry(entry: dict) -> str:
     """
     Cerca di inferire l'estensione originale dell'audio embedded.
@@ -677,15 +728,22 @@ def _build_entry_selection_list(entries: List[dict]) -> List[Tuple[int, dict]]:
     return valid
 
 
-def _entry_label_for_menu(item: Tuple[int, dict], _i: int) -> str:
+def _entry_label_for_menu(item, _i: int) -> str:
+    """
+    Versione aggiornata di _entry_label_for_menu che mostra
+    category e difficulty nella lista di selezione.
+    """
     idx, e = item
-    sample_id = _extract_sample_id(e, idx)
-    q = _extract_question(e)
-    short_q = q if len(q) <= 100 else (q[:97] + "...")
-    audio_src = _get_audio_source_debug_string(e)
-    if len(audio_src) > 60:
-        audio_src = audio_src[:57] + "..."
-    return f"{sample_id} | {short_q} | audio_src={audio_src}"
+    sample_id = str(
+        e.get("identifier") or e.get("question_id") or e.get("id") or f"sample_{idx}"
+    )
+    q = str(e.get("question", "")).strip()
+    short_q = q if len(q) <= 80 else (q[:77] + "...")
+
+    category = _extract_entry_category(e)
+    difficulty = _extract_entry_difficulty(e)
+
+    return f"{sample_id} | [{category} / {difficulty}] | {short_q}"
 
 def _build_hummusqa_background_pairs_local(
     entries: List[dict],
@@ -798,6 +856,9 @@ def main():
     target_question = _extract_question(target_entry)
     target_options = _extract_options(target_entry)
     target_correct_answer = target_options[0]
+    target_category = _extract_entry_category(target_entry)
+    target_difficulty = _extract_entry_difficulty(target_entry)
+    target_macro_family = _extract_entry_macro_family(target_category)
 
     try:
         target_audio_path = _materialize_hummusqa_audio(
@@ -826,6 +887,8 @@ def main():
     for i, opt in enumerate(target_options):
         print(f"  {chr(65 + i)}. {opt}")
     print(f"Correct:       {target_correct_answer}")
+    print(f"Category:      {target_category}")
+    print(f"Difficulty:    {target_difficulty}")
     print("=" * 60)
 
     _write_run_info(run_dir, {
@@ -840,6 +903,9 @@ def main():
         "hummusqa_meta_path": hummusqa_meta_path,
         "env": _collect_reproducible_env_snapshot(),
         "analysis_2_module_config": get_dime_module_config_snapshot(),
+        "target_category": target_category,
+        "target_difficulty": target_difficulty,
+        "target_macro_family": target_macro_family,
     })
 
     # -------------------------
