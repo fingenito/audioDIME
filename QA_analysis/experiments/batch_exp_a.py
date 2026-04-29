@@ -598,6 +598,7 @@ def extract_exp_a_fields(
     mi1_time: List[float] = [float(x) for x in agg.get("mi1_time", [0.0] * 8)]
     stem_names: List[str] = list(agg.get("stem_names", ["drums", "bass", "other", "vocals"]))
 
+
     # FIX: segment_boundaries_sec è una LISTA DI DICT, non di float
     seg_boundaries_raw = agg.get("segment_boundaries_sec", [])
     seg_boundaries_dicts = _normalize_segment_boundaries(seg_boundaries_raw)
@@ -818,7 +819,10 @@ def extract_exp_d_fields(
         [float(v) for v in row]
         for row in agg.get("uc1_global_stem_segment", [])
     ]
+    mi1_stem: List[float] = [float(x) for x in (agg.get("mi1_stem") or [0.0] * 4)]
+    uc1_stem: List[float] = [float(x) for x in (agg.get("uc1_stem") or [0.0] * 4)]
     stem_names: List[str] = list(agg.get("stem_names", ["drums", "bass", "other", "vocals"]))
+
 
     # --- Grounding matrix approssimata: prodotto esterno mi2_word × mi1_time ---
     # G[w, s] ≈ mi2_global_word[w] × mi1_time[s]
@@ -848,6 +852,9 @@ def extract_exp_d_fields(
         "mi1_time": mi1_time,
         "uc1_time": uc1_time,
         "segment_boundaries_sec": seg_boundaries,
+
+        "mi1_stem": mi1_stem,
+        "uc1_stem": uc1_stem,
 
         # Audio: matrice stems × segmenti
         "stem_names": stem_names,
