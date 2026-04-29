@@ -237,7 +237,7 @@ MIN_FREE_GB_RUNNER = 21.0
 # =============================================================================
 # TEST MODE — modifica reversibile
 # =============================================================================
-TEST_FIRST_N_VALID_SAMPLES: Optional[int] = 5
+TEST_FIRST_N_VALID_SAMPLES: Optional[int] = None
 
 
 # Macrofamiglie per l'analisi aggregata.
