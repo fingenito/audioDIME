@@ -1,0 +1,92 @@
+{
+  "status": "merged",
+  "model_path": "/nas/home/fingenito/Models/Qwen2.5-Omni-7B",
+  "dataset_name": "mtg-upf/HumMusQA",
+  "dataset_split": "test",
+  "dataset_path": null,
+  "max_samples": 46,
+  "sample_start": 0,
+  "option_permutations": 3,
+  "option_seed": 42,
+  "categories": null,
+  "difficulties": null,
+  "capture_layer_range": [
+    0,
+    28
+  ],
+  "max_answer_search_tokens": 8,
+  "attn_implementation_at_load": "sdpa",
+  "attention_mode": "avllm_literal_generate",
+  "generation_probe_results": null,
+  "score_only_results": null,
+  "cached_decode_prefill_attn_implementation": null,
+  "device_map": "cuda:0",
+  "model_class": "Qwen2_5OmniForConditionalGeneration_talker_disabled",
+  "talker": "disabled",
+  "baseline_device": null,
+  "option_order_protocol": "deterministic unique randomized order per question; canonical option index 0 is answer",
+  "complete_consistency_groups": 46,
+  "semantic_consistency_rate": 0.6739130434782609,
+  "n_scored_without_attention": 0,
+  "score_only_accuracy": null,
+  "condition": "silence",
+  "silence_path": "/nas/home/fingenito/Thesis_project/QA_analysis/data/audio_silence.wav",
+  "errors": [],
+  "methodological_note": "Experiment 1b — silent audio control condition for HumMusQA attention pattern analysis. Identical to Experiment 1 in all respects EXCEPT that a single pre-existing silent WAV file is substituted for the real HumMusQA audio on every evaluation. The silence file is passed via prepare_inputs(audio_path_override=silence_path), which bypasses materialize_audio() and sets should_delete=False so the shared silence file is never removed between evaluations. Model: Qwen2_5OmniForConditionalGeneration with attn_implementation='sdpa' (eager fallback via self_attn pre-hook for decode) and disable_talker(). Attention captured via register_forward_hook on each self_attn layer (model.thinker.model.layers[i].self_attn). Hooks store output[1] (attention weights) which is non-None only at decode steps where a self_attn pre-hook injects output_attentions=True for q_len==1. With attention_mode=avllm_literal_generate (primary): model.generate() produces a short response; the first standalone A/B/C/D token's attention towards the multimodal prompt (with silent audio) is extracted from the hook storage. Text tokens are split into instruction/scaffold, question, options, and other_text using tokenizer offsets over the rendered Qwen chat template. Output schema is identical to Experiment 1 — merge_exp1_shards.py and plot_exp1_attention_pattern.py work without modification.",
+  "important_note": "Experiment 1b measures answer-token attention when the audio input is silent (all zeros). Comparing to Experiment 1 (real audio) reveals whether the attention distribution is content-driven or a structural property of the architecture. If accuracy with silence ≈ 66% (same as real audio), the model responds from text alone.",
+  "n_processed": 960,
+  "n_correct": 467,
+  "accuracy_over_saved_evaluations": 0.486458,
+  "saved_at": "2026-06-09T09:40:40.419365",
+  "files": {
+    "attention_per_layer": "/nas/home/fingenito/Thesis_project/QA_analysis/Results_QA/experiments/exp_Net/exp1_attention/silence_baseline_7b_3perm_parallel_merged/attention_per_layer.csv",
+    "summary_stats": "/nas/home/fingenito/Thesis_project/QA_analysis/Results_QA/experiments/exp_Net/exp1_attention/silence_baseline_7b_3perm_parallel_merged/summary_stats.csv"
+  },
+  "n_errors": 0,
+  "merged_at": "2026-06-09T09:51:32.465044",
+  "n_shards": 7,
+  "shard_breakdown": [
+    {
+      "shard": "shard_0",
+      "n_processed": 138,
+      "n_correct": 81,
+      "n_errors": 0
+    },
+    {
+      "shard": "shard_1",
+      "n_processed": 138,
+      "n_correct": 53,
+      "n_errors": 0
+    },
+    {
+      "shard": "shard_2",
+      "n_processed": 138,
+      "n_correct": 63,
+      "n_errors": 0
+    },
+    {
+      "shard": "shard_3",
+      "n_processed": 138,
+      "n_correct": 49,
+      "n_errors": 0
+    },
+    {
+      "shard": "shard_4",
+      "n_processed": 138,
+      "n_correct": 71,
+      "n_errors": 0
+    },
+    {
+      "shard": "shard_5",
+      "n_processed": 138,
+      "n_correct": 81,
+      "n_errors": 0
+    },
+    {
+      "shard": "shard_6",
+      "n_processed": 132,
+      "n_correct": 69,
+      "n_errors": 0
+    }
+  ]
+}

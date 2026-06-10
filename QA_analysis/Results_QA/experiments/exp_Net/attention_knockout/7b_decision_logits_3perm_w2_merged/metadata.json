@@ -1,0 +1,160 @@
+{
+  "status": "merged",
+  "model_path": "/nas/home/fingenito/Models/Qwen2.5-Omni-7B",
+  "dataset_name": "mtg-upf/HumMusQA",
+  "dataset_split": "test",
+  "dataset_path": null,
+  "sample_start": 0,
+  "max_samples": 46,
+  "option_permutations": 3,
+  "option_seed": 42,
+  "components": [
+    "audio",
+    "question",
+    "options",
+    "instruction",
+    "all_text_to_audio"
+  ],
+  "layer_windows": [
+    [
+      0,
+      2
+    ],
+    [
+      2,
+      4
+    ],
+    [
+      4,
+      6
+    ],
+    [
+      6,
+      8
+    ],
+    [
+      8,
+      10
+    ],
+    [
+      10,
+      12
+    ],
+    [
+      12,
+      14
+    ],
+    [
+      14,
+      16
+    ],
+    [
+      16,
+      18
+    ],
+    [
+      18,
+      20
+    ],
+    [
+      20,
+      22
+    ],
+    [
+      22,
+      24
+    ],
+    [
+      24,
+      26
+    ],
+    [
+      26,
+      28
+    ]
+  ],
+  "knockout_mode": "decision_logits",
+  "generate_max_new_tokens": 16,
+  "generate_use_cache": true,
+  "knockout_source": "decision",
+  "label_token_style": "bare",
+  "label_token_ids": {
+    "A": 32,
+    "B": 33,
+    "C": 34,
+    "D": 35
+  },
+  "label_token_decoded": {
+    "A": "A",
+    "B": "B",
+    "C": "C",
+    "D": "D"
+  },
+  "model_class": "Qwen2_5OmniForConditionalGeneration",
+  "requested_model_class": "full",
+  "attn_implementation": "sdpa",
+  "n_processed": 960,
+  "n_correct": 638,
+  "baseline_accuracy": 0.664583,
+  "methodological_note": "AVLLM-style attention knockout adapted to HumMusQA. In generation mode, baseline and knockout answers are produced with model.generate(), and hooks block either generated-token attention (literal AVLLM) or final prompt decision attention (MCQ first-token causal variant) to one prompt component. In decision_logits mode, hooks block final prompt decision attention to one component and changes are measured on restricted A/B/C/D logits.",
+  "errors": [],
+  "n_rows": 67200,
+  "saved_at": "2026-05-29T18:41:33.824665",
+  "n_errors": 0,
+  "merged_at": "2026-05-30T08:29:17.979972",
+  "n_shards": 7,
+  "shard_breakdown": [
+    {
+      "shard": "shard_0",
+      "n_rows": 9660,
+      "n_processed": 138,
+      "n_correct": 101,
+      "n_errors": 0
+    },
+    {
+      "shard": "shard_1",
+      "n_rows": 9660,
+      "n_processed": 138,
+      "n_correct": 76,
+      "n_errors": 0
+    },
+    {
+      "shard": "shard_2",
+      "n_rows": 9660,
+      "n_processed": 138,
+      "n_correct": 93,
+      "n_errors": 0
+    },
+    {
+      "shard": "shard_3",
+      "n_rows": 9660,
+      "n_processed": 138,
+      "n_correct": 79,
+      "n_errors": 0
+    },
+    {
+      "shard": "shard_4",
+      "n_rows": 9660,
+      "n_processed": 138,
+      "n_correct": 100,
+      "n_errors": 0
+    },
+    {
+      "shard": "shard_5",
+      "n_rows": 9660,
+      "n_processed": 138,
+      "n_correct": 92,
+      "n_errors": 0
+    },
+    {
+      "shard": "shard_6",
+      "n_rows": 9240,
+      "n_processed": 132,
+      "n_correct": 97,
+      "n_errors": 0
+    }
+  ],
+  "files": {
+    "attention_knockout_results": "/nas/home/fingenito/Thesis_project/QA_analysis/Results_QA/experiments/exp_Net/attention_knockout/7b_decision_logits_3perm_w2_merged/attention_knockout_results.csv"
+  }
+}
