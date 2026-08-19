@@ -198,7 +198,7 @@ def _merge_short_segments(
 
         if len(_segments_from_boundaries(boundaries)) <= max(1, int(target_num_segments)):
             # non fermiamo forzatamente qui, ma evitiamo merge eccessivo
-            pass
+            break
 
     return boundaries
 
@@ -465,7 +465,7 @@ def compute_onset_guided_segments_from_stems(
     max_internal = max(0, int(target_n_segments) - 1)
 
     if len(internal) > max_internal and max_internal > 0:
-        interxnal = sorted(internal, key=lambda x: x[1], reverse=True)[:max_internal]
+        internal = sorted(internal, key=lambda x: x[1], reverse=True)[:max_internal]
         internal = sorted(internal, key=lambda x: x[0])
 
     boundaries = [0] + [int(s) for s, _w in internal] + [audio_length]
@@ -568,18 +568,19 @@ class SourceSeparationBasedFactorization(Factorization):
         composition_fn: Optional[Callable[[Any], Any]] = None,
     ):
         self._temporal_segmentation_params = temporal_segmentation_params
-        super().__init__(input, target_sr, temporal_segmentation_params, composition_fn)
+        seg_type = None
+        if isinstance(temporal_segmentation_params, dict):
+            seg_type = str(temporal_segmentation_params.get("type", "")).strip().lower()
+
+        if seg_type == "onset_guided":
+            n_segs = int(temporal_segmentation_params.get("n_temporal_segments", 8))
+            _init_params = {"type": "fixed_length", "n_temporal_segments": n_segs}
+        else:
+            _init_params = temporal_segmentation_params
+
+        super().__init__(input, target_sr, _init_params, composition_fn)
 
         self.original_components, self._components_names = self.initialize_components()
-
-        # ==========================================================
-        # NUOVO: se la segmentazione è onset-guided, la costruiamo
-        # DOPO la source separation, usando i 4 stem come guida.
-        # Manteniamo però una griglia condivisa tra gli stem.
-        # ==========================================================
-        seg_type = None
-        if isinstance(self._temporal_segmentation_params, dict):
-            seg_type = str(self._temporal_segmentation_params.get("type", "")).strip().lower()
 
         if seg_type == "onset_guided":
             self.temporal_segments, self.explained_length = compute_onset_guided_segments_from_stems(
@@ -588,7 +589,6 @@ class SourceSeparationBasedFactorization(Factorization):
                 temporal_segmentation_params=dict(self._temporal_segmentation_params),
                 audio_length=len(self._original_mix),
             )
-
         self.prepare_components(0, len(self._original_mix))
 
     def compose_model_input(self, components: Optional[Sequence[int]] = None):

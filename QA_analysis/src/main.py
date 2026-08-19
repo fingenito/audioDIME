@@ -111,6 +111,10 @@ def _apply_reproducible_env() -> None:
         "DIME_AUDIOLIME_NUM_TEMPORAL_SEGMENTS": "8",
         "DIME_AUDIOLIME_MAX_FEATURES": "40",
         "DIME_AUDIOLIME_MIN_R2": "0.25",
+        "DIME_AUDIOLIME_SEGMENTATION_MODE": "onset_guided",
+        "DIME_AUDIOLIME_ONSET_MIN_SEGMENT_SEC": "1.5",
+        "DIME_AUDIOLIME_ONSET_MAX_SEGMENT_SEC": "12.0",
+        "DIME_AUDIOLIME_ONSET_BACKTRACK": "1",
 
         # ==========================================================
         # MM-SHAP — più finestra per 8 GPU
