@@ -159,6 +159,10 @@ def _apply_env() -> None:
         "DIME_AUDIOLIME_DEMUCS_SPLIT": "1",
         "DIME_AUDIOLIME_DEMUCS_OVERLAP": "0.25",
         "DIME_AUDIOLIME_NUM_TEMPORAL_SEGMENTS": "8",
+        "DIME_AUDIOLIME_SEGMENTATION_MODE": "onset_guided",
+        "DIME_AUDIOLIME_ONSET_MIN_SEGMENT_SEC": "1.5",
+        "DIME_AUDIOLIME_ONSET_MAX_SEGMENT_SEC": "12.0",
+        "DIME_AUDIOLIME_ONSET_BACKTRACK": "1",
         "DIME_AUDIOLIME_PRECOMPUTED_DIR":
             "/nas/home/fingenito/Thesis_project/QA_analysis/data/demucs_cache",
         "DIME_AUDIOLIME_NORMALIZE_COMPOSITION": "1",
@@ -209,7 +213,7 @@ from QA_analysis.experiments.expE.perturbations_exp_e import (
 # 2) Costanti
 # =============================================================================
 EXPERIMENT_RESULTS_ROOT = (
-    "/nas/home/fingenito/Thesis_project/QA_analysis/Results_QA/experiments"
+    "/nas/home/fingenito/Thesis_project/QA_analysis/Results_paper/experiments"
 )
 MODEL_PATH = "/nas/home/fingenito/Models/Qwen2.5-Omni-7B"
 HUMMUSQA_PATH = "/nas/home/fingenito/HumMusQA/data"

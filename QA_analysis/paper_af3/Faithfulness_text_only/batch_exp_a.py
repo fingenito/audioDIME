@@ -1,0 +1,1227 @@
+"""
+Experiment A — Batch runner (Audio Flamingo 3) — variante text_only
+=====================================================================
+Copia adattata di paper_af3/Faithfulness_correct/batch_exp_a.py (stessa
+identica infrastruttura AF3: Af3TokenRunner, cache PKV, risposta a lettera
+singola, fix di correttezza) con lo stesso delta gia' applicato da Qwen in
+paper/Faithfulness_text_only/batch_exp_a.py rispetto al proprio caso base:
+
+    - l'audio reale di ogni sample viene ignorato e sostituito da un unico
+      file di white noise (NULL_AUDIO_PATH), cosi' l'unica informazione che
+      arriva al modello e' testuale;
+    - il pool di background audio per DIME usa file fisicamente distinti
+      con lo stesso contenuto (NULL_AUDIO_BG_PATHS), per evitare che il
+      dedup-by-path di _target_first_paths() li collassi tutti;
+    - segmentazione fixed_length invece di onset_guided (l'audio e'
+      comunque silenzio costante, non c'e' struttura da rilevare).
+
+Nessun'altra differenza rispetto al caso base AF3: stessa metodologia
+DIME+MM-SHAP, stessa cache PKV, stessa risposta a lettera singola.
+
+Itera su tutti i sample HumMusQA, esegue MM-SHAP + DIME per ciascuno,
+estrae i campi necessari per Exp A e li salva come JSON compatti.
+Nessun plot per sample. I plot vengono rimossi subito dopo l'estrazione.
+
+Output layout:
+    Results_paper_af3/experiments/exp_A/batch_run_XX/
+        run_info.json               ← config + env del batch
+        progress.json               ← checkpoint: completed / failed / pending
+        per_sample/
+            {sample_id}_exp_a.json  ← campi Exp A estratti (leggero)
+        aggregated/
+            exp_a_results.parquet   ← tabella aggregata finale
+            exp_a_results.csv       ← copia CSV per ispezione rapida
+
+Utilizzo:
+    python -m QA_analysis.paper_af3.Faithfulness_text_only.batch_exp_a
+"""
+
+import os
+import re
+import gc
+import sys
+import json
+import glob
+import time
+import shutil
+import hashlib
+import logging
+import argparse
+import tempfile
+import traceback
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import librosa
+import soundfile as sf
+
+
+# =============================================================================
+# 0a) Soppressione warning verbose
+# =============================================================================
+
+import warnings as _warnings
+_warnings.filterwarnings("ignore", category=DeprecationWarning)
+_warnings.filterwarnings("ignore", category=FutureWarning)
+_warnings.filterwarnings("ignore", category=UserWarning)
+
+# Silenzia TensorFlow/absl/grpc PRIMA di qualsiasi import del progetto
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("ABSL_LOGGING_VERBOSITY", "3")
+
+# IMPORTANTE: PYTHONWARNINGS viene letto dai sub-processi spawn.
+os.environ.setdefault(
+    "PYTHONWARNINGS",
+    "ignore::DeprecationWarning,ignore::FutureWarning,ignore::UserWarning"
+)
+
+# Pre-importa nel processo padre i moduli deprecati con i filtri attivi.
+# Quando dopo audioread.rawread tenterà di reimportarli, sono già in
+# sys.modules e non emetteranno più warning.
+with _warnings.catch_warnings():
+    _warnings.simplefilter("ignore")
+    for _mod in ("aifc", "audioop", "sunau"):
+        try:
+            __import__(_mod)
+        except Exception:
+            pass
+
+# Silenzia absl
+try:
+    import absl.logging
+    absl.logging.set_verbosity(absl.logging.ERROR)
+    absl.logging.set_stderrthreshold("error")
+except Exception:
+    pass
+
+
+# =============================================================================
+# 0b) Filtro su stderr — droppa righe rumorose dai worker spawn
+# =============================================================================
+
+_NOISE_PATTERNS = (
+    "aifc",
+    "audioop",
+    "sunau",
+    "is deprecated and slated for removal",
+    "DeprecationWarning",
+    "FutureWarning",
+    "oneDNN custom operations are on",
+    "oneDNN",
+    "absl::InitializeLog",
+    "All log messages before",
+    "I0000 00:",
+    "port.cc:",
+    "Could not load symbol",
+    "TF_ENABLE_ONEDNN",
+)
+
+class _StderrFilter:
+    """
+    Wrapper attorno a stderr che droppa righe contenenti pattern rumorosi.
+    Tracebacks ed errori veri ('Error:', 'Exception:', 'Traceback') passano sempre.
+    """
+    def __init__(self, real):
+        self._real = real
+        self._buf = ""
+
+    def write(self, s):
+        if not s:
+            return
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._emit_line(line + "\n")
+
+    def _emit_line(self, line):
+        stripped = line.strip()
+        if not stripped:
+            self._real.write(line)
+            return
+        # Errori veri passano sempre
+        if any(k in stripped for k in ("Traceback", "Error:", "Exception:", "CRITICAL", "FAIL")):
+            self._real.write(line)
+            return
+        # Filtra rumore noto
+        if any(p in stripped for p in _NOISE_PATTERNS):
+            return
+        self._real.write(line)
+
+    def flush(self):
+        if self._buf:
+            self._emit_line(self._buf)
+            self._buf = ""
+        self._real.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+# Attiva il filtro
+sys.stderr = _StderrFilter(sys.stderr)
+
+
+# =============================================================================
+# 0c) ENV — deve stare prima di qualsiasi import del progetto
+# =============================================================================
+
+def _apply_env() -> None:
+    env_cfg = {
+        "TRANSFORMERS_NO_TF": "1",
+        "DIME_BG_AUDIO_DIR": "...",
+        "TF_CPP_MIN_LOG_LEVEL": "3",
+        "DIME_VALUE_MODE": "logit",
+        "DIME_PROMPTS_FILE": "",
+        "DIME_NUM_EXPECTATION_SAMPLES": "16",
+        "DIME_NUM_LIME_SAMPLES": "512",
+        "DIME_LIME_NUM_FEATURES_AUDIO": "16",
+        "DIME_LIME_NUM_FEATURES_TEXT": "10",
+        "DIME_QUEUE_WINDOW": "320",
+        # =16 (=DIME_NUM_EXPECTATION_SAMPLES): ogni chunk copre un'intera riga
+        # della L-table (Step 2) invece di due mezze righe -- necessario
+        # perche' il worker AF3 ora applica la cache PKV per riga (stesso i,
+        # j che varia): con batch_size < N il prefisso condiviso per lo
+        # stesso i verrebbe ricalcolato piu' volte, una per chunk.
+        "DIME_L_BATCH_SIZE": "16",
+        "DIME_LIME_BATCH_SIZE": "8",
+        "DIME_WORKER_INNER_BATCH_SIZE": "8",
+        "DIME_STEP5_AUDIO_PERTURB_BATCH": "128",
+        "DIME_STEP5_TEXT_PERTURB_BATCH": "256",
+        "DIME_AUDIO_FEATURE_MODE": "audiolime_demucs",
+        "DIME_AUDIOLIME_DEMUCS_MODEL": "htdemucs",
+        "DIME_AUDIOLIME_USE_PRECOMPUTED": "1",
+        "DIME_AUDIOLIME_RECOMPUTE": "0",
+        "DIME_AUDIOLIME_DEMUCS_DEVICE": "cpu",
+        "DIME_AUDIOLIME_DEMUCS_SEGMENT": "8",
+        "DIME_AUDIOLIME_DEMUCS_SPLIT": "1",
+        "DIME_AUDIOLIME_DEMUCS_OVERLAP": "0.25",
+        "DIME_AUDIOLIME_NUM_TEMPORAL_SEGMENTS": "8",
+        "DIME_AUDIOLIME_MAX_FEATURES": "40",
+        "DIME_AUDIOLIME_MIN_R2": "0.25",
+        # text_only: audio silenzioso fisso -> nessun onset da rilevare,
+        # segmentazione fixed_length (l'audio e' comunque vuoto). Stesso
+        # identico scelta fatta da Qwen (paper/Faithfulness_text_only).
+        "DIME_AUDIOLIME_SEGMENTATION_MODE": "fixed_length",
+        "DIME_AUDIOLIME_PRECOMPUTED_DIR": "/nas/home/fingenito/Thesis_project/QA_analysis/data/demucs_cache",
+        "MMSHAP_QUEUE_WINDOW": "128",
+        "DIME_WORKER_EMPTYCACHE_EVERY": "32",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.8",
+        "DIME_STEP4A_AUDIO_IO_MODE": "auto",
+        "DIME_STEP4A_AUDIO_EQ_ATOL": "1e-5",
+        "DIME_STEP4A_AUDIO_EQ_RTOL": "1e-4",
+        "DIME_STEP4A_RUNNER_AUDIO_TRANSPORT": "shared_memory",
+        "OMP_NUM_THREADS": "4",
+        "MKL_NUM_THREADS": "4",
+        "NUMEXPR_NUM_THREADS": "4",
+        "DIME_FIXED_AUDIO_TRANSPORT_CACHE": "1",
+        "DIME_FIXED_AUDIO_TRANSPORT_MODE": "shared_memory",
+        "DIME_QWEN_TEXT_CACHE_SIZE": "4096",
+        # AF3: cache PKV per dime_row_values_batch/dime_col_values_batch/
+        # dime_L_batch, portata e validata da Qwen (vedi gpu_utils_af3.py e
+        # paper_af3/Faithfulness_correct/batch_exp_a.py per la cronologia
+        # completa di validazione: confronto A/B, isolamento del rumore,
+        # calibrazione ATOL, VERIFY spento dopo conferma che il suo costo
+        # fisso -- 2 forward pass pieni extra per gruppo sempre -- era il
+        # vero collo di bottiglia, non il fallback occasionale).
+        "DIME_TEXT_PKV_CACHE": "1",
+        "DIME_TEXT_PKV_CACHE_VERIFY": "0",
+        "DIME_TEXT_PKV_CACHE_MIN_COMMON_PREFIX": "8",
+        "DIME_TEXT_PKV_CACHE_ATOL": "0.4",
+        "DIME_TEXT_PKV_CACHE_RTOL": "1e-4",
+        "DIME_TEXT_PKV_CACHE_DEBUG": "0",
+        "DIME_REUSE_PERTURBATIONS_ACROSS_TOKENS": "1",
+        "TORCH_HOME": "/nas/home/fingenito/Thesis_project/QA_analysis/data/torch_cache",
+        "TORCH_HUB": "/nas/home/fingenito/Thesis_project/QA_analysis/data/torch_cache/hub",
+    }
+    for k, v in env_cfg.items():
+        os.environ[k] = str(v)
+
+_apply_env()
+
+# =============================================================================
+# 1) Import progetto
+# =============================================================================
+
+from transformers import AutoProcessor
+
+from QA_analysis.utils.analysis_1 import analysis_1_start
+from QA_analysis.utils.analysis_2 import analyze_dime, get_dime_module_config_snapshot
+from QA_analysis.utils.gpu_utils import get_available_gpus_with_memory
+from QA_analysis.utils.gpu_utils_af3 import try_create_af3_token_runner
+from QA_analysis.utils.shared_utils import (
+    load_hummusqa_entries_parquet,
+    build_hummusqa_qwen25_prompt,
+)
+
+# =============================================================================
+# 2) Costanti
+# =============================================================================
+
+HUMMUSQA_ROOT = "/nas/home/fingenito/HumMusQA/data"
+EXPERIMENT_RESULTS_ROOT = "/nas/home/fingenito/Thesis_project/QA_analysis/Results_paper_af3/experiments"
+MODEL_PATH = "/nas/home/fingenito/Models/audio-flamingo-3-hf"
+
+# text_only: l'audio reale di ogni sample viene sostituito da questo unico file
+# di white noise, cosi' l'unica informazione che arriva al modello e' testuale.
+# Stesso file usato dalla variante Qwen (paper/Faithfulness_text_only).
+NULL_AUDIO_PATH = "/nas/home/fingenito/Thesis_project/QA_analysis/data/white_noise.wav"
+
+# Pool di background audio per DIME: file fisicamente distinti (stesso
+# contenuto white noise, path diversi) cosi' il dedup-by-path di
+# _target_first_paths() non li collassa tutti su un solo elemento come
+# succederebbe riusando NULL_AUDIO_PATH per tutti i sample.
+NULL_AUDIO_BG_DIR = "/nas/home/fingenito/Thesis_project/QA_analysis/data/white_noise_bg"
+NULL_AUDIO_BG_PATHS = [
+    os.path.join(NULL_AUDIO_BG_DIR, f"white_noise_bg_{i:02d}.wav") for i in range(16)
+]
+
+MAX_GPUS_TO_USE = 8
+# Stessa soglia usata dal caso base AF3 (Faithfulness_correct): richiede una
+# GPU quasi completamente libera prima di usarla.
+MIN_FREE_GB_RUNNER = 21.0
+
+# =============================================================================
+# TEST MODE — modifica reversibile
+# =============================================================================
+TEST_FIRST_N_VALID_SAMPLES: Optional[int] = None
+
+
+# Macrofamiglie per l'analisi aggregata.
+MACRO_FAMILY_MAP: Dict[str, str] = {
+    "Instrumentation":   "percettiva",
+    "Sound Texture":     "percettiva",
+    "Metre and Rhythm":  "percettiva",
+    "Musical Texture":   "percettiva",
+    "Harmony":           "analitica",
+    "Melody":            "analitica",
+    "Structure":         "analitica",
+    "Performance":       "analitica",
+    "Genre and Style":   "knowledge",
+    "Historical":        "knowledge",
+    "Mood and Expression": "knowledge",
+}
+
+# =============================================================================
+# 3) Logging
+# =============================================================================
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+logger = logging.getLogger("ExpA-AF3-TextOnly-Batch")
+_h = logging.StreamHandler(sys.stdout)
+_h.setLevel(logging.INFO)
+_h.setFormatter(logging.Formatter("%(asctime)s [ExpA-AF3-TextOnly] %(levelname)s — %(message)s"))
+logger.handlers = [_h]
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+for _noisy in ["transformers", "huggingface_hub", "datasets", "urllib3",
+               "qwen_omni_utils", "QwenOmni"]:
+    _lg = logging.getLogger(_noisy)
+    _lg.setLevel(logging.ERROR)
+    _lg.propagate = False
+
+for _extra in ["tensorflow", "jax", "grpc", "absl", "torch", "matplotlib",
+               "torch.distributed", "demucs", "demucs.api", "h5py"]:
+    _lg = logging.getLogger(_extra)
+    _lg.setLevel(logging.ERROR)
+    _lg.propagate = False
+
+try:
+    from transformers.utils import logging as _hf_log
+    _hf_log.set_verbosity_error()
+    _hf_log.disable_progress_bar()
+except Exception:
+    pass
+
+# =============================================================================
+# 4) Helpers generali
+# =============================================================================
+
+def _ensure_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _next_batch_dir(exp_root: str) -> str:
+    _ensure_dir(exp_root)
+    existing = [
+        int(n[10:]) for n in os.listdir(exp_root)
+        if n.startswith("batch_run_") and n[10:].isdigit()
+    ]
+    nxt = (max(existing) + 1) if existing else 0
+    d = os.path.join(exp_root, f"batch_run_{nxt:02d}")
+    os.makedirs(d, exist_ok=False)
+    return d
+
+
+def _atomic_json_dump(data: Any, path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        prefix=".tmp_", suffix=".json", dir=os.path.dirname(os.path.abspath(path))
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(_make_json_safe(data), f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def _make_json_safe(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.decode("utf-8", errors="replace")
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {str(k): _make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_make_json_safe(x) for x in obj]
+    return str(obj)
+
+
+def _sha1_file(path: str) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _sha1_bytes(data: bytes) -> str:
+    h = hashlib.sha1()
+    h.update(data)
+    return h.hexdigest()
+
+
+def _sha1_array(arr: np.ndarray) -> str:
+    h = hashlib.sha1()
+    h.update(np.asarray(arr, dtype=np.float32).tobytes())
+    return h.hexdigest()
+
+# =============================================================================
+# 5) HumMusQA helpers
+# =============================================================================
+
+_CATEGORY_FIELDS = ["main_category", "category", "Category"]
+_DIFFICULTY_FIELDS = ["difficulty", "Difficulty"]
+
+
+def _get_field(entry: dict, candidates: List[str], default: str = "") -> str:
+    for key in candidates:
+        val = entry.get(key, None)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return default
+
+
+def extract_hummusqa_meta(entry: dict, idx: int) -> Dict[str, Any]:
+    """
+    Estrae i metadati di un entry HumMusQA, inclusi category e difficulty.
+    """
+    sample_id = str(
+        entry.get("identifier") or
+        entry.get("question_id") or
+        entry.get("id") or
+        f"sample_{idx}"
+    )
+
+    question = str(entry.get("question", "")).strip()
+    correct_answer_str = str(entry.get("answer", "")).strip()
+    options = [
+        correct_answer_str,
+        str(entry.get("distractor_1", "")).strip(),
+        str(entry.get("distractor_2", "")).strip(),
+        str(entry.get("distractor_3", "")).strip(),
+    ]
+
+    category = _get_field(entry, _CATEGORY_FIELDS, default="unknown")
+    difficulty = _get_field(entry, _DIFFICULTY_FIELDS, default="unknown")
+
+    macro = "unknown"
+    for keyword, family in MACRO_FAMILY_MAP.items():
+        if keyword.lower() in category.lower():
+            macro = family
+            break
+
+    return {
+        "sample_id": sample_id,
+        "idx": idx,
+        "question": question,
+        "options": options,
+        "correct_answer_str": correct_answer_str,
+        "category": category,
+        "difficulty": difficulty,
+        "macro_family": macro,
+    }
+
+
+def _entry_has_valid_mcqa(entry: dict) -> bool:
+    q = str(entry.get("question", "")).strip()
+    opts = [
+        str(entry.get("answer", "")).strip(),
+        str(entry.get("distractor_1", "")).strip(),
+        str(entry.get("distractor_2", "")).strip(),
+        str(entry.get("distractor_3", "")).strip(),
+    ]
+    return bool(q) and len(opts) == 4 and all(opts)
+
+
+def _infer_audio_ext(entry: dict) -> str:
+    audio_field = entry.get("audio", None)
+    if isinstance(audio_field, dict):
+        for k in ["path", "audio_path", "filename", "file"]:
+            v = audio_field.get(k, "")
+            if isinstance(v, str) and v.strip():
+                _, ext = os.path.splitext(v.lower())
+                if ext in {".wav", ".mp3", ".flac", ".ogg", ".m4a"}:
+                    return ext
+    return ".mp3"
+
+
+def materialize_audio(entry: dict, cache_dir: str, idx: int) -> str:
+    """
+    Restituisce un path WAV canonico per il sample.
+
+    text_only: l'audio reale del dataset viene ignorato. Ogni sample usa lo
+    stesso file di white noise (NULL_AUDIO_PATH), cosi' la spiegazione
+    DIME/Exp A viene calcolata sul solo canale testuale. Stessa identica
+    logica della variante Qwen (paper/Faithfulness_text_only/batch_exp_a.py).
+    """
+    if not os.path.exists(NULL_AUDIO_PATH):
+        raise FileNotFoundError(
+            f"Audio null (white noise) non trovato: {NULL_AUDIO_PATH}"
+        )
+    return NULL_AUDIO_PATH
+
+# =============================================================================
+# 6) Estrazione campi Exp A dai JSON
+# =============================================================================
+
+def _answer_to_letter(correct_answer_str: str, options: List[str]) -> str:
+    """Converte la stringa della risposta corretta nella lettera corrispondente."""
+    for i, opt in enumerate(options):
+        if str(opt).strip().lower() == correct_answer_str.strip().lower():
+            return chr(65 + i)
+    return "A"
+
+
+def _normalize_segment_boundaries(raw_boundaries: Any) -> List[Dict[str, Optional[float]]]:
+    """
+    DIME salva 'segment_boundaries_sec' come LISTA DI DICT della forma:
+        [{"segment_index": 0, "segment_start_sec": 0.0, "segment_end_sec": 7.5}, ...]
+
+    Per robustezza accettiamo anche formati alternativi (lista di float, lista di
+    coppie [start, end]) e li convertiamo nello stesso formato dict.
+    """
+    if not raw_boundaries or not isinstance(raw_boundaries, (list, tuple)):
+        return []
+
+    out: List[Dict[str, Optional[float]]] = []
+    for i, item in enumerate(raw_boundaries):
+        if isinstance(item, dict):
+            try:
+                seg_idx = int(item.get("segment_index", i))
+            except (TypeError, ValueError):
+                seg_idx = i
+            try:
+                s_start = float(item["segment_start_sec"]) if item.get("segment_start_sec") is not None else None
+            except (TypeError, ValueError):
+                s_start = None
+            try:
+                s_end = float(item["segment_end_sec"]) if item.get("segment_end_sec") is not None else None
+            except (TypeError, ValueError):
+                s_end = None
+            out.append({
+                "segment_index": seg_idx,
+                "segment_start_sec": s_start,
+                "segment_end_sec": s_end,
+            })
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            try:
+                out.append({
+                    "segment_index": i,
+                    "segment_start_sec": float(item[0]),
+                    "segment_end_sec": float(item[1]),
+                })
+            except (TypeError, ValueError):
+                continue
+        else:
+            try:
+                v = float(item)
+                prev_end = out[-1]["segment_end_sec"] if out and out[-1]["segment_end_sec"] is not None else 0.0
+                out.append({
+                    "segment_index": i,
+                    "segment_start_sec": prev_end,
+                    "segment_end_sec": v,
+                })
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def extract_exp_a_fields(
+    dime_json: dict,
+    mmshap_json: dict,
+    meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Estrae tutti i campi necessari per Exp A da un run DIME + MM-SHAP.
+
+    Chiavi DIME (audio_global_aggregations):
+        uc1_stem [4], mi1_stem [4]               - aggregato su time
+        uc1_time [N_seg], mi1_time [N_seg]       - aggregato su stems
+        uc1_global_stem_segment [4][N_seg]
+        mi1_global_stem_segment [4][N_seg]
+        stem_names [4]
+        segment_boundaries_sec  → LISTA DI DICT (segment_index, segment_start_sec, segment_end_sec)
+
+    Chiavi MM-SHAP:
+        A-SHAP, T-SHAP, baseline_answer_raw, correct_answer, options
+    """
+    # ---- MM-SHAP ----
+    a_shap = float(mmshap_json.get("A-SHAP", 0.0))
+    t_shap = float(mmshap_json.get("T-SHAP", 0.0))
+    baseline_answer_raw = str(mmshap_json.get("baseline_answer_raw", "")).strip().upper()
+    # AF3, a differenza di Qwen, puo' rispondere in free-form con testo dopo
+    # la lettera (es. "(A) RIFF" invece della lettera nuda "A") -- estraiamo
+    # solo la lettera iniziale per il confronto di correttezza, stesso
+    # pattern "(X" gia' verificato per AF3 in get_letter_token_ids_af3.
+    # (In questa variante la risposta e' gia' forzata a lettera singola da
+    # _generate_text_response_af3, ma il parsing resta robusto comunque.)
+    _m = re.match(r"^\(?\s*([A-D])\b", baseline_answer_raw)
+    model_answer = _m.group(1) if _m else baseline_answer_raw
+    options = mmshap_json.get("options", [])
+    correct_answer_str = str(mmshap_json.get("correct_answer", "")).strip()
+    correct_letter = _answer_to_letter(correct_answer_str, options)
+    correct = (model_answer == correct_letter)
+
+    # ---- DIME audio aggregations ----
+    agg = dime_json.get("audio_global_aggregations", {})
+    uc1_stem: List[float] = [float(x) for x in agg.get("uc1_stem", [0.0] * 4)]
+    mi1_stem: List[float] = [float(x) for x in agg.get("mi1_stem", [0.0] * 4)]
+    uc1_time: List[float] = [float(x) for x in agg.get("uc1_time", [0.0] * 8)]
+    mi1_time: List[float] = [float(x) for x in agg.get("mi1_time", [0.0] * 8)]
+    stem_names: List[str] = list(agg.get("stem_names", ["drums", "bass", "other", "vocals"]))
+
+
+    # FIX: segment_boundaries_sec è una LISTA DI DICT, non di float
+    seg_boundaries_raw = agg.get("segment_boundaries_sec", [])
+    seg_boundaries_dicts = _normalize_segment_boundaries(seg_boundaries_raw)
+    seg_starts: List[Optional[float]] = [d["segment_start_sec"] for d in seg_boundaries_dicts]
+    seg_ends:   List[Optional[float]] = [d["segment_end_sec"]   for d in seg_boundaries_dicts]
+
+    # matrici 4×N_seg stems × segments
+    uc1_matrix = [[float(v) for v in row] for row in agg.get("uc1_global_stem_segment", [])]
+    mi1_matrix = [[float(v) for v in row] for row in agg.get("mi1_global_stem_segment", [])]
+
+    # ---- DIME text ----
+    wl = dime_json.get("wordlevel", {})
+    prompt_wl = wl.get("prompt", {})
+    question_words: List[str] = list(prompt_wl.get("words", []))
+    uc2_words: List[float] = [float(x) for x in prompt_wl.get("uc2_global_word", [])]
+    mi2_words: List[float] = [float(x) for x in prompt_wl.get("mi2_global_word", [])]
+
+    # ---- base logit ----
+    explanations = dime_json.get("explanations", {})
+    base_ucmi = None
+    if "0" in explanations:
+        base_ucmi = explanations["0"].get("base_ucmi", None)
+    if base_ucmi is not None:
+        try:
+            base_ucmi = float(base_ucmi)
+        except (TypeError, ValueError):
+            base_ucmi = None
+
+    # ---- Scalari aggregati ----
+    uc_audio_l1 = float(np.sum(np.abs(uc1_stem)))
+    mi_audio_l1 = float(np.sum(np.abs(mi1_stem)))
+    uc_text_l1 = float(np.sum(np.abs(uc2_words)))
+    mi_text_l1 = float(np.sum(np.abs(mi2_words)))
+
+    uc_audio_sum = float(np.sum(uc1_stem))
+    mi_audio_sum = float(np.sum(mi1_stem))
+    uc_text_sum = float(np.sum(uc2_words))
+    mi_text_sum = float(np.sum(mi2_words))
+
+    return {
+        # Identifiers
+        "sample_id": meta["sample_id"],
+        "idx": meta["idx"],
+        "question": meta["question"],
+        "category": meta["category"],
+        "difficulty": meta["difficulty"],
+        "macro_family": meta["macro_family"],
+
+        # Risposta
+        "model_answer": model_answer,
+        "correct_answer_letter": correct_letter,
+        "correct": correct,
+
+        # MM-SHAP
+        "a_shap": a_shap,
+        "t_shap": t_shap,
+
+        # DIME scalari (L1)
+        "uc_audio_l1": uc_audio_l1,
+        "mi_audio_l1": mi_audio_l1,
+        "uc_text_l1": uc_text_l1,
+        "mi_text_l1": mi_text_l1,
+
+        # DIME scalari (somma algebrica)
+        "uc_audio_sum": uc_audio_sum,
+        "mi_audio_sum": mi_audio_sum,
+        "uc_text_sum": uc_text_sum,
+        "mi_text_sum": mi_text_sum,
+
+        # DIME vettori per stem
+        "stem_names": stem_names,
+        "uc1_stem": uc1_stem,
+        "mi1_stem": mi1_stem,
+
+        # DIME vettori per segmento temporale
+        "uc1_time": uc1_time,
+        "mi1_time": mi1_time,
+
+        # Boundaries: dict-list originale + due vettori paralleli
+        "segment_boundaries_sec": seg_boundaries_dicts,
+        "segment_starts_sec": seg_starts,
+        "segment_ends_sec": seg_ends,
+
+        # DIME matrici stems × segments
+        "uc1_stem_x_seg": uc1_matrix,
+        "mi1_stem_x_seg": mi1_matrix,
+
+        # DIME testo per parola
+        "question_words": question_words,
+        "uc2_words": uc2_words,
+        "mi2_words": mi2_words,
+
+        # Valore base DIME
+        "base_ucmi": base_ucmi,
+    }
+
+# =============================================================================
+# 7) Cleanup artifacts
+# =============================================================================
+
+def cleanup_run_artifacts(run_dir: str) -> None:
+    """Rimuove .png, .npy e dir L_tables. Mantiene i .json."""
+    for ext in ("*.png", "*.npy"):
+        for f in glob.glob(os.path.join(run_dir, "**", ext), recursive=True):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+    ltables = os.path.join(run_dir, "L_tables")
+    if os.path.isdir(ltables):
+        try:
+            shutil.rmtree(ltables)
+        except Exception:
+            pass
+
+# =============================================================================
+# 8) Checkpoint
+# =============================================================================
+
+def _load_progress(batch_dir: str) -> Dict[str, Any]:
+    path = os.path.join(batch_dir, "progress.json")
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {"completed": [], "failed": [], "pending": []}
+
+
+def _save_progress(batch_dir: str, progress: Dict[str, Any]) -> None:
+    _atomic_json_dump(progress, os.path.join(batch_dir, "progress.json"))
+
+# =============================================================================
+# 9) Aggregazione finale
+# =============================================================================
+
+def aggregate_exp_a_results(batch_dir: str) -> str:
+    try:
+        import pandas as pd
+    except ImportError:
+        raise ImportError("pandas richiesto. pip install pandas")
+
+    per_sample_dir = os.path.join(batch_dir, "per_sample")
+    records = []
+    for jf in sorted(glob.glob(os.path.join(per_sample_dir, "*_exp_a.json"))):
+        with open(jf, "r") as f:
+            records.append(json.load(f))
+
+    if not records:
+        logger.warning("Nessun file _exp_a.json trovato — aggregazione vuota.")
+        return ""
+
+    flat_records = []
+    for r in records:
+        row = {k: v for k, v in r.items() if not isinstance(v, (list, dict))}
+
+        for stem_idx, stem in enumerate(r.get("stem_names", ["drums", "bass", "other", "vocals"])):
+            uc = r.get("uc1_stem", [])
+            mi = r.get("mi1_stem", [])
+            row[f"uc_stem_{stem}"] = float(uc[stem_idx]) if stem_idx < len(uc) else float("nan")
+            row[f"mi_stem_{stem}"] = float(mi[stem_idx]) if stem_idx < len(mi) else float("nan")
+
+        for seg_idx in range(8):
+            uc_t = r.get("uc1_time", [])
+            mi_t = r.get("mi1_time", [])
+            row[f"uc_time_seg{seg_idx}"] = float(uc_t[seg_idx]) if seg_idx < len(uc_t) else float("nan")
+            row[f"mi_time_seg{seg_idx}"] = float(mi_t[seg_idx]) if seg_idx < len(mi_t) else float("nan")
+
+        flat_records.append(row)
+
+    df = pd.DataFrame(flat_records)
+
+    agg_dir = _ensure_dir(os.path.join(batch_dir, "aggregated"))
+    parquet_path = os.path.join(agg_dir, "exp_a_results.parquet")
+    csv_path = os.path.join(agg_dir, "exp_a_results.csv")
+
+    df.to_parquet(parquet_path, index=False)
+    df.to_csv(csv_path, index=False)
+
+    logger.info(f"Aggregazione completata: {len(df)} sample → {parquet_path}")
+    return parquet_path
+
+# =============================================================================
+# 10) Estrazione Exp D
+# =============================================================================
+def extract_exp_d_fields(
+        dime_json: dict,
+        meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Estrae i campi per l'Esperimento D dal DIME JSON.
+    NON richiede nessuna modifica a analysis_2.py.
+
+    La grounding_matrix parola×segmento è approssimata come prodotto esterno:
+        G[w, s] ≈ mi2_global_word[w] × mi1_time[s]
+    Questo è una proxy dei marginali separati, non la vera interazione
+    cross-modale. Va dichiarato come limitazione metodologica.
+    """
+    wl = dime_json.get("wordlevel", {})
+    prompt_wl = wl.get("prompt", {})
+    agg = dime_json.get("audio_global_aggregations", {})
+
+    # --- Parole della domanda e loro importanza ---
+    prompt_words: List[str] = list(prompt_wl.get("words", []))
+    mi2_global_word: List[float] = [float(x) for x in prompt_wl.get("mi2_global_word", [])]
+    uc2_global_word: List[float] = [float(x) for x in prompt_wl.get("uc2_global_word", [])]
+
+    # --- Segmenti audio ---
+    mi1_time: List[float] = [float(x) for x in agg.get("mi1_time", [])]
+    uc1_time: List[float] = [float(x) for x in agg.get("uc1_time", [])]
+    seg_boundaries_raw = agg.get("segment_boundaries_sec", [])
+    seg_boundaries = _normalize_segment_boundaries(seg_boundaries_raw)
+
+    # --- Matrice stems × segmenti ---
+    mi1_stem_x_seg: List[List[float]] = [
+        [float(v) for v in row]
+        for row in agg.get("mi1_global_stem_segment", [])
+    ]
+    uc1_stem_x_seg: List[List[float]] = [
+        [float(v) for v in row]
+        for row in agg.get("uc1_global_stem_segment", [])
+    ]
+    mi1_stem: List[float] = [float(x) for x in (agg.get("mi1_stem") or [0.0] * 4)]
+    uc1_stem: List[float] = [float(x) for x in (agg.get("uc1_stem") or [0.0] * 4)]
+    stem_names: List[str] = list(agg.get("stem_names", ["drums", "bass", "other", "vocals"]))
+
+
+    # --- Grounding matrix approssimata: prodotto esterno mi2_word × mi1_time ---
+    # G[w, s] ≈ mi2_global_word[w] × mi1_time[s]
+    # LIMITAZIONE: non è la vera cross-modale; è la proxy dei marginali separati.
+    grounding_matrix_approx: List[List[float]] = []
+    if mi2_global_word and mi1_time:
+        arr_w = np.array(mi2_global_word, dtype=float)
+        arr_s = np.array(mi1_time, dtype=float)
+        G = np.outer(arr_w, arr_s)
+        grounding_matrix_approx = G.tolist()
+
+    # --- Feature metadata per segmenti (boundaries in sec) ---
+    audio_axis_info = dime_json.get("audio_axis_info", {})
+
+    return {
+        "sample_id": meta["sample_id"],
+        "category": meta["category"],
+        "difficulty": meta["difficulty"],
+        "macro_family": meta["macro_family"],
+
+        # Testo: parole della domanda + importanza
+        "prompt_words": prompt_words,
+        "mi2_global_word": mi2_global_word,
+        "uc2_global_word": uc2_global_word,
+
+        # Audio: importanza per segmento temporale
+        "mi1_time": mi1_time,
+        "uc1_time": uc1_time,
+        "segment_boundaries_sec": seg_boundaries,
+
+        "mi1_stem": mi1_stem,
+        "uc1_stem": uc1_stem,
+
+        # Audio: matrice stems × segmenti
+        "stem_names": stem_names,
+        "mi1_stem_x_seg": mi1_stem_x_seg,
+        "uc1_stem_x_seg": uc1_stem_x_seg,
+
+        # Grounding matrix approssimata (prodotto esterno marginali)
+        "grounding_matrix_approx": grounding_matrix_approx,
+        "grounding_matrix_method": "outer_product_marginali",  # dichiarazione limitazione
+
+        # Metadata audio axis
+        "audio_axis_info": audio_axis_info,
+    }
+
+# =============================================================================
+# 11) Main batch loop
+# =============================================================================
+
+def run_batch_exp_a(
+    resume_dir: Optional[str] = None,
+    only_aggregate: bool = False,
+) -> str:
+    exp_root = os.path.join(EXPERIMENT_RESULTS_ROOT, "exp_A")
+    _ensure_dir(exp_root)
+
+    if resume_dir:
+        batch_dir = resume_dir
+        logger.info(f"Riprendendo batch esistente: {batch_dir}")
+    else:
+        batch_dir = _next_batch_dir(exp_root)
+        logger.info(f"Nuova batch dir: {batch_dir}")
+
+    per_sample_dir = _ensure_dir(os.path.join(batch_dir, "per_sample"))
+    audio_cache_dir = _ensure_dir(os.path.join(batch_dir, "_audio_cache"))
+
+    if only_aggregate:
+        logger.info("Modalità only-aggregate: salto inferenza.")
+        aggregate_exp_a_results(batch_dir)
+        return batch_dir
+
+    logger.info(f"Caricamento HumMusQA da: {HUMMUSQA_ROOT}")
+    entries, parquet_files = load_hummusqa_entries_parquet(HUMMUSQA_ROOT)
+    valid_entries = [(i, e) for i, e in enumerate(entries) if _entry_has_valid_mcqa(e)]
+    logger.info(f"Entry valide: {len(valid_entries)} / {len(entries)}")
+
+    if TEST_FIRST_N_VALID_SAMPLES is not None:
+        valid_entries = valid_entries[:int(TEST_FIRST_N_VALID_SAMPLES)]
+        logger.info(f"[TEST MODE] Uso solo i primi {len(valid_entries)} sample validi.")
+
+    if valid_entries:
+        _, sample_entry = valid_entries[0]
+        cat_found = any(k in sample_entry for k in _CATEGORY_FIELDS)
+        diff_found = any(k in sample_entry for k in _DIFFICULTY_FIELDS)
+        if not cat_found:
+            logger.warning(
+                f"⚠ Nessun campo category trovato. Campi: {list(sample_entry.keys())}"
+            )
+        if not diff_found:
+            logger.warning(
+                f"⚠ Nessun campo difficulty trovato. Campi: {list(sample_entry.keys())}"
+            )
+
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"Model path non trovato: {MODEL_PATH}")
+
+    gpu_ids, _ = get_available_gpus_with_memory(min_free_memory_gb=MIN_FREE_GB_RUNNER)
+    gpu_ids = gpu_ids[:MAX_GPUS_TO_USE]
+    if not gpu_ids:
+        raise RuntimeError(f"Nessuna GPU con >= {MIN_FREE_GB_RUNNER} GB liberi.")
+    logger.info(f"GPU selezionate: {gpu_ids}")
+
+    runner = try_create_af3_token_runner(
+        model_path=MODEL_PATH,
+        min_free_memory_gb=MIN_FREE_GB_RUNNER,
+        gpu_ids_physical=gpu_ids,
+    )
+    if runner is None:
+        raise RuntimeError("Runner non attivo.")
+
+    processor = AutoProcessor.from_pretrained(MODEL_PATH)
+
+    _atomic_json_dump(
+        {
+            "batch_dir": batch_dir,
+            "exp": "A",
+            "variant": "text_only",
+            "model": "audio-flamingo-3-hf",
+            "hummusqa_root": HUMMUSQA_ROOT,
+            "parquet_files": [str(p) for p in parquet_files],
+            "n_valid_entries": len(valid_entries),
+            "test_first_n_valid_samples": TEST_FIRST_N_VALID_SAMPLES,
+            "gpu_ids": gpu_ids,
+            "model_path": MODEL_PATH,
+            "null_audio_path": NULL_AUDIO_PATH,
+            "dime_module_config": get_dime_module_config_snapshot(),
+        },
+        os.path.join(batch_dir, "run_info.json"),
+    )
+
+    logger.info("Pre-materializzazione audio (con cache disco)...")
+    all_audio_paths: List[str] = []
+    all_prompts: List[str] = []
+    all_metas: List[Dict[str, Any]] = []
+
+    for orig_idx, entry in valid_entries:
+        meta = extract_hummusqa_meta(entry, orig_idx)
+        try:
+            audio_path = materialize_audio(entry, audio_cache_dir, orig_idx)
+        except Exception as e:
+            logger.warning(f"Audio skip per idx={orig_idx}: {e}")
+            all_audio_paths.append("")
+            all_prompts.append("")
+            all_metas.append(meta)
+            continue
+        prompt = build_hummusqa_qwen25_prompt(meta["question"], meta["options"])
+        all_audio_paths.append(audio_path)
+        all_prompts.append(prompt)
+        all_metas.append(meta)
+
+    progress = _load_progress(batch_dir)
+    completed_ids = set(progress.get("completed", []))
+
+    total = len(valid_entries)
+    logger.info(
+        f"Stato checkpoint: {len(completed_ids)} completati, "
+        f"{total - len(completed_ids)} da fare."
+    )
+
+    try:
+        for batch_pos, (orig_idx, entry) in enumerate(valid_entries):
+            meta = all_metas[batch_pos]
+            sample_id = meta["sample_id"]
+            audio_path = all_audio_paths[batch_pos]
+            prompt = all_prompts[batch_pos]
+
+            if sample_id in completed_ids:
+                logger.info(f"[{batch_pos+1}/{total}] SKIP (già completato): {sample_id}")
+                continue
+
+            if not audio_path or not os.path.exists(audio_path):
+                logger.warning(f"[{batch_pos+1}/{total}] SKIP (audio mancante): {sample_id}")
+                if not isinstance(progress.get("failed"), list):
+                    progress["failed"] = []
+                progress["failed"].append({"sample_id": sample_id, "error": "audio_missing"})
+                _save_progress(batch_dir, progress)
+                continue
+
+            logger.info(
+                f"[{batch_pos+1}/{total}] {sample_id} | "
+                f"cat={meta['category']} | diff={meta['difficulty']} | "
+                f"q={meta['question'][:60]}..."
+            )
+
+            t0 = time.time()
+            try:
+                tmp_run_dir = _ensure_dir(os.path.join(batch_dir, "_tmp_run", sample_id))
+                dime_dir = _ensure_dir(os.path.join(tmp_run_dir, "dime"))
+                mmshap_dir = _ensure_dir(os.path.join(tmp_run_dir, "mmshap"))
+
+                # text_only: l'audio e' lo stesso file per tutti i sample, quindi
+                # non ha senso (e collasserebbe per dedup-by-path) prenderlo in
+                # prestito da all_audio_paths. Usiamo il pool fisso di file
+                # fisicamente distinti (NULL_AUDIO_BG_PATHS). bg_prompts invece
+                # resta identico al caso base: sottocampionato in modo
+                # indipendente dal pool audio, cosi' il lato testo mantiene
+                # tutta la sua varianza di background.
+                bg_audio = list(NULL_AUDIO_BG_PATHS)
+                bg_prompts = [p for i, p in enumerate(all_prompts)
+                              if i != batch_pos and p]
+                n_bg = int(os.environ.get("DIME_NUM_EXPECTATION_SAMPLES", "16"))
+                rng = np.random.RandomState(0)
+                if len(bg_prompts) > n_bg - 1:
+                    sel = rng.choice(len(bg_prompts), size=n_bg - 1, replace=False).tolist()
+                    bg_prompts = [bg_prompts[i] for i in sel]
+                if len(bg_audio) > n_bg - 1:
+                    bg_audio = bg_audio[: n_bg - 1]
+
+                # ---- Timing per fase (diagnostica velocita') ----
+                _pkv_on = os.environ.get("DIME_TEXT_PKV_CACHE", "1").lower() in ("1", "true", "yes")
+                logger.info(
+                    f"  [timing] {sample_id}: inizio -- DIME_TEXT_PKV_CACHE={'ON' if _pkv_on else 'OFF'} "
+                    f"DIME_L_BATCH_SIZE={os.environ.get('DIME_L_BATCH_SIZE')}"
+                )
+
+                # ---- Baseline condivisa ----
+                t_caption0 = time.time()
+                caption = runner.generate_caption(audio_path=audio_path, prompt=prompt)
+                logger.info(f"  [timing] {sample_id}: caption completata in {time.time()-t_caption0:.1f}s")
+                shared_baseline = {
+                    "baseline_answer": caption,
+                    "prompt": prompt,
+                    "audio_path": audio_path,
+                    "input_ids": None,
+                    "output_ids": None,
+                }
+
+                # ---- MM-SHAP ----
+                qa_entry = {
+                    "sample_id": sample_id,
+                    "audio_path": audio_path,
+                    "question": meta["question"],
+                    "options": meta["options"],
+                    "correct_answer": meta["correct_answer_str"],
+                }
+                t_mmshap0 = time.time()
+                mmshap_results = analysis_1_start(
+                    model=None,
+                    processor=processor,
+                    results_dir=mmshap_dir,
+                    runner=runner,
+                    qa_entry=qa_entry,
+                    shared_baseline=shared_baseline,
+                )
+                logger.info(f"  [timing] {sample_id}: MM-SHAP completato in {time.time()-t_mmshap0:.1f}s")
+
+                # ---- DIME ----
+                t_dime0 = time.time()
+                dime_results = analyze_dime(
+                    model=None,
+                    processor=processor,
+                    audio_path=audio_path,
+                    prompt=prompt,
+                    caption=caption,
+                    results_dir=dime_dir,
+                    runner=runner,
+                    background_audio_paths=bg_audio,
+                    background_prompts=bg_prompts,
+                    question=meta["question"],
+                    options=meta["options"],
+                    num_lime_samples=int(os.environ.get("DIME_NUM_LIME_SAMPLES", "512")),
+                    num_features=int(os.environ.get("DIME_LIME_NUM_FEATURES_AUDIO", "16")),
+                )
+                logger.info(f"  [timing] {sample_id}: DIME completato in {time.time()-t_dime0:.1f}s")
+
+                # ---- Path JSON ----
+                # DIME espone json_path nel return; MM-SHAP no, lo costruiamo da convenzione
+                dime_json_path = dime_results.get("json_path", "") if isinstance(dime_results, dict) else ""
+                mmshap_json_path = mmshap_results.get("json_path", "") if isinstance(mmshap_results, dict) else ""
+                if not mmshap_json_path:
+                    mmshap_json_path = os.path.join(mmshap_dir, f"{sample_id}_mmshap.json")
+
+                if not dime_json_path or not os.path.exists(dime_json_path):
+                    raise FileNotFoundError(
+                        f"DIME JSON non trovato. Path atteso: '{dime_json_path}'. "
+                        f"Contenuto di {dime_dir}: {os.listdir(dime_dir) if os.path.isdir(dime_dir) else 'DIR INESISTENTE'}"
+                    )
+                if not os.path.exists(mmshap_json_path):
+                    raise FileNotFoundError(
+                        f"MM-SHAP JSON non trovato. Path atteso: '{mmshap_json_path}'. "
+                        f"Contenuto di {mmshap_dir}: {os.listdir(mmshap_dir) if os.path.isdir(mmshap_dir) else 'DIR INESISTENTE'}"
+                    )
+
+                with open(dime_json_path, "r") as f:
+                    dime_json = json.load(f)
+                with open(mmshap_json_path, "r") as f:
+                    mmshap_json = json.load(f)
+
+                exp_a_row = extract_exp_a_fields(dime_json, mmshap_json, meta)
+                exp_d_row = extract_exp_d_fields(dime_json, meta)
+                out_d_path = os.path.join(per_sample_dir, f"{sample_id}_exp_d.json")
+                _atomic_json_dump(exp_d_row, out_d_path)
+
+                out_path = os.path.join(per_sample_dir, f"{sample_id}_exp_a.json")
+                _atomic_json_dump(exp_a_row, out_path)
+
+                cleanup_run_artifacts(dime_dir)
+                cleanup_run_artifacts(mmshap_dir)
+                shutil.rmtree(tmp_run_dir, ignore_errors=True)
+
+                elapsed = time.time() - t0
+                logger.info(
+                    f"  ✓ {sample_id} completato in {elapsed:.0f}s | "
+                    f"A-SHAP={exp_a_row['a_shap']:.3f} | "
+                    f"correct={exp_a_row['correct']}"
+                )
+
+                completed_ids.add(sample_id)
+                progress["completed"] = sorted(completed_ids)
+                _save_progress(batch_dir, progress)
+
+                gc.collect()
+
+            except Exception as e:
+                elapsed = time.time() - t0
+                tb = traceback.format_exc()
+                logger.error(f"  ✗ {sample_id} FALLITO dopo {elapsed:.0f}s:\n{tb}")
+                if not isinstance(progress.get("failed"), list):
+                    progress["failed"] = []
+                progress["failed"].append({
+                    "sample_id": sample_id,
+                    "error": str(e),
+                    "traceback": tb[:2000],
+                })
+                _save_progress(batch_dir, progress)
+                try:
+                    shutil.rmtree(
+                        os.path.join(batch_dir, "_tmp_run", sample_id),
+                        ignore_errors=True,
+                    )
+                except Exception:
+                    pass
+                gc.collect()
+                continue
+
+    finally:
+        try:
+            runner.stop()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(os.path.join(batch_dir, "_tmp_run"), ignore_errors=True)
+        except Exception:
+            pass
+
+    logger.info("Batch completato. Avvio aggregazione...")
+    aggregate_exp_a_results(batch_dir)
+
+    logger.info(
+        f"\n{'='*60}\n"
+        f"BATCH EXP A (AF3, text_only) COMPLETATO\n"
+        f"  completati : {len(completed_ids)}\n"
+        f"  batch dir  : {batch_dir}\n"
+        f"{'='*60}"
+    )
+    return batch_dir
+
+
+# =============================================================================
+# 11) Entry point
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Batch runner Esperimento A (Audio Flamingo 3, text_only)")
+    parser.add_argument("--resume", type=str, default=None, metavar="BATCH_DIR")
+    parser.add_argument("--only-aggregate", action="store_true")
+    args = parser.parse_args()
+
+    if args.only_aggregate and not args.resume:
+        raise ValueError("--only-aggregate richiede --resume <batch_dir>")
+
+    run_batch_exp_a(
+        resume_dir=args.resume,
+        only_aggregate=args.only_aggregate,
+    )
+
+
+if __name__ == "__main__":
+    main()
