@@ -1,4 +1,4 @@
-# audioDIME: Do Audio Language Models Really Listen?
+# Investigating Multimodal Contributions in Large Language Models Using audioDIME
 
 Interpretability pipeline for multimodal music question answering with Qwen2.5-Omni.
 
