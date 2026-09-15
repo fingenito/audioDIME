@@ -218,7 +218,7 @@ EXPERIMENT_RESULTS_ROOT = (
 MODEL_PATH = "/nas/home/fingenito/Models/Qwen2.5-Omni-7B"
 HUMMUSQA_PATH = "/nas/home/fingenito/HumMusQA/data"
 
-MAX_GPUS_TO_USE = 8
+MAX_GPUS_TO_USE = 4
 MIN_FREE_GB_RUNNER = 21.0
 
 K_MAX_MAIN: int = 16

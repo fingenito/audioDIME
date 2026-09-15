@@ -238,7 +238,7 @@ MODEL_PATH = "/nas/home/fingenito/Models/Qwen2.5-Omni-7B"
 # l'audio. Le opzioni di risposta restano invariate.
 NULL_QUESTION = "[MASK]"
 
-MAX_GPUS_TO_USE = 4
+MAX_GPUS_TO_USE = 8
 MIN_FREE_GB_RUNNER = 21.0
 
 # =============================================================================

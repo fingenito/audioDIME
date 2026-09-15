@@ -3,7 +3,7 @@ Experiment A — Analisi e grafici
 =================================
 Utilizzo:
     python -m QA_analysis.experiments.expA.plots_exp_a \
-        --batch-dir .../exp_A/batch_run_00
+        --batch-dir .../exp_A/batch_run_00_non_completo
 """
 
 import os

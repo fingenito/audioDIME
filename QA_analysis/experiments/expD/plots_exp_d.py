@@ -16,7 +16,7 @@ Figure:
   G-D4: esempi qualitativi, uno per pattern
 
 Uso:
-  python -m QA_analysis.experiments.expD.plots_exp_d --batch-dir /nas/home/fingenito/Thesis_project/QA_analysis/Results_QA/experiments/exp_A/batch_run_00
+  python -m QA_analysis.experiments.expD.plots_exp_d --batch-dir /nas/home/fingenito/Thesis_project/QA_analysis/Results_QA/experiments/exp_A/batch_run_00_non_completo
 
 STEM_MARKERS = {
     "drums": [
