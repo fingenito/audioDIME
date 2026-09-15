@@ -1,0 +1,102 @@
+{
+  "status": "complete",
+  "model_path": "/nas/home/fingenito/Models/audio-flamingo-3-hf",
+  "dataset_name": "mtg-upf/HumMusQA",
+  "dataset_split": "test",
+  "dataset_path": null,
+  "sample_start": 40,
+  "max_samples": 40,
+  "option_permutations": 3,
+  "option_seed": 42,
+  "components": [
+    "audio",
+    "question",
+    "options",
+    "instruction",
+    "all_text_to_audio"
+  ],
+  "layer_windows": [
+    [
+      0,
+      2
+    ],
+    [
+      2,
+      4
+    ],
+    [
+      4,
+      6
+    ],
+    [
+      6,
+      8
+    ],
+    [
+      8,
+      10
+    ],
+    [
+      10,
+      12
+    ],
+    [
+      12,
+      14
+    ],
+    [
+      14,
+      16
+    ],
+    [
+      16,
+      18
+    ],
+    [
+      18,
+      20
+    ],
+    [
+      20,
+      22
+    ],
+    [
+      22,
+      24
+    ],
+    [
+      24,
+      26
+    ],
+    [
+      26,
+      28
+    ]
+  ],
+  "knockout_mode": "decision_logits",
+  "generate_max_new_tokens": 16,
+  "generate_use_cache": true,
+  "knockout_source": "decision",
+  "label_token_style": "paren",
+  "label_token_ids": {
+    "A": 4346,
+    "B": 5349,
+    "C": 3025,
+    "D": 5432
+  },
+  "label_token_decoded": {
+    "A": "(A",
+    "B": "(B",
+    "C": "(C",
+    "D": "(D"
+  },
+  "model_class": "AudioFlamingo3ForConditionalGeneration",
+  "attn_implementation": "sdpa",
+  "n_processed": 120,
+  "n_correct": 68,
+  "baseline_accuracy": 0.566667,
+  "methodological_note": "AVLLM-style attention knockout adapted to HumMusQA. In generation mode, baseline and knockout answers are produced with model.generate(), and hooks block either generated-token attention (literal AVLLM) or final prompt decision attention (MCQ first-token causal variant) to one prompt component. In decision_logits mode, hooks block final prompt decision attention to one component and changes are measured on restricted A/B/C/D logits.",
+  "errors": [],
+  "n_rows": 8400,
+  "saved_at": "2026-09-08T23:48:35.055610"
+}
