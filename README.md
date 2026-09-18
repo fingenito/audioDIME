@@ -6,7 +6,7 @@ Interpretability pipeline for multimodal music question answering with Qwen2.5-O
 
 ## Overview
 
-**audioDIME** is the codebase accompanying the Master's thesis *"audioDIME: Do Audio Language Models Really Listen?"* (Music and Acoustic Engineering, Politecnico di Milano, 2025–2026).
+**audioDIME** is the codebase accompanying the Master's thesis *"Investigating Multimodal Contributions in Large Language Models Using audioDIME"* (Music and Acoustic Engineering, Politecnico di Milano, 2025–2026).
 
 The project builds a post-hoc interpretability pipeline to investigate whether **Qwen2.5-Omni-7B** genuinely uses audio information when solving **Music Question Answering** tasks on the **HumMusQA** benchmark, or whether its decisions are primarily driven by textual priors.
 
